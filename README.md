@@ -4,8 +4,6 @@ Telegram alerts and a small remote-control surface for **NinjaTrader 8**, as a s
 
 > **Status: beta (v0.1.0).** It can flatten positions on command, so read [Limitations](#limitations) and the [Disclaimer](#disclaimer) before running it anywhere near live money. Not affiliated with or endorsed by NinjaTrader or Telegram.
 
-<!-- Add redacted screenshots here, e.g.: ![Fill alert](docs/images/fill-alert.png) -->
-
 ## What it does
 
 **Alerts**
@@ -48,7 +46,7 @@ Out of sync for 25s. Check the copier and the follower connections.
 
 ## Requirements
 
-- Windows with NinjaTrader 8 (tested on: **[fill in version]**)
+- Windows with NinjaTrader 8 (tested on: **8.1.8.4**)
 - A Telegram account and a bot token from [@BotFather](https://t.me/BotFather)
 - Outbound HTTPS to `api.telegram.org`
 
@@ -124,23 +122,21 @@ Pings are skipped while NinjaTrader's UI is frozen, so a hung NinjaTrader also t
 
 ## Verified so far
 
-Update this table to match what you have actually tested before publishing.
-
 | Feature | Status |
 |---|---|
-| Compiles | ⬜ |
+| Compiles | ✅ |
 | Fill alerts, partial fills | ✅ earlier build |
 | `/status`, `/flatten` | ✅ earlier build |
 | Connection drop / restore alerts | ✅ earlier build |
-| Heartbeat ping | ⬜ |
-| Restart report | ⬜ |
-| Rejected-order and order-rate alerts | ⬜ |
-| Strategy enabled / disabled alerts | ⬜ |
+| Heartbeat ping | ✅ |
+| Restart report | ✅ |
+| Rejected-order and order-rate alerts | ✅ |
+| Strategy enabled / disabled alerts | ✅ |
 | Stale-data alerts | ⬜ |
 | Copier mismatch alerts | ⬜ |
 | End-of-day summary | ⬜ |
 
-Tested with NinjaTrader **[version]**, **[broker / data provider]**, **[Sim / live]**.
+Tested with NinjaTrader **8.1.8.4**, **Tradovate / MFFU**, **Sim**.
 
 ## Troubleshooting
 

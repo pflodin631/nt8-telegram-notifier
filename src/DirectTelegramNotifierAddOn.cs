@@ -45,7 +45,7 @@ using CbiPosition = NinjaTrader.Cbi.Position;
 //     ignored, so a stale /flatten never runs after a restart or reboot.
 //   * /flatten covers the tracked account(s) only, unless UseGlobalFlattenEverything=true.
 //
-//  Version 0.1.0, MIT License. Not affiliated with or endorsed by NinjaTrader or Telegram.
+//  Version 0.1.1, MIT License. Not affiliated with or endorsed by NinjaTrader or Telegram.
 //  Provided as is, without warranty. Automated trading and remote order control carry risk.
 //
 //  Written in C# 5 syntax so it compiles on any NinjaScript compiler version.
@@ -62,7 +62,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string ConfigFileName       = "DirectTelegramNotifier.config";
         private const int    PollIntervalMs       = 3000;
         private const int    HousekeepingMs       = 5000;
-        private const int    FillAggregationMs    = 1200;
+        private const int    FillAggregationMs    = 2000;
         private const int    FillAlertMaxAgeSec   = 300;
         private const int    CommandMaxAgeSec     = 120;
         private const int    UiFreezeAlertSec     = 45;
@@ -76,7 +76,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const int    RunawayCooldownSec   = 300;
         private const int    StopMessageTimeoutMs = 3500;
         private const int    ConnectionMergeMs    = 1500;
-        private const string AddOnVersion        = "0.1.0";
+        private const string AddOnVersion        = "0.1.1";
         private const string HeartbeatFileName    = "DirectTelegramNotifier.heartbeat";
         private const string Sep                  = " \u00B7 ";
 
@@ -92,6 +92,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const string EmRocket = "\U0001F680";
         private const string EmSiren  = "\U0001F6A8";
         private const string EmPlay   = "\u25B6\uFE0F";
+        private const string EmWait   = "\u23F3";
 
         #endregion
 
@@ -143,18 +144,24 @@ namespace NinjaTrader.NinjaScript.AddOns
             public double LargestLoss;
         }
 
-        private sealed class PendingFill
+        // Fills of one instrument and side that arrive close together, one leg per account.
+        private sealed class FillLeg
         {
             public string AccountName;
-            public CbiInstrument Instrument;
-            public string InstrumentName;
-            public bool IsBuy;
             public string ActionText;
             public string OrderName;
             public int Quantity;
             public double Notional;
             public int FillCount;
-            public DateTime LastTime;
+        }
+
+        private sealed class FillGroup
+        {
+            public CbiInstrument Instrument;
+            public string InstrumentName;
+            public bool IsBuy;
+            public DateTime FirstTime;
+            public readonly Dictionary<string, FillLeg> Legs = new Dictionary<string, FillLeg>(StringComparer.OrdinalIgnoreCase);
         }
 
         // Connection events that arrive together (orders + data of one connection) are sent as one message.
@@ -288,7 +295,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private DateTime lastEodReportDate = DateTime.MinValue;
 
         private readonly object fillLock = new object();
-        private readonly Dictionary<string, PendingFill> pendingFills = new Dictionary<string, PendingFill>();
+        private readonly Dictionary<string, FillGroup> pendingFills = new Dictionary<string, FillGroup>();
 
         private readonly object connLock = new object();
         private readonly Dictionary<string, DateTime> connDownSinceUtc = new Dictionary<string, DateTime>();
@@ -446,11 +453,12 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             StringBuilder sb = new StringBuilder();
             sb.Append(EmRocket).Append(" <b>Notifier online</b>").Append(Sep).Append("v").Append(AddOnVersion).Append("\n");
-            sb.Append("Accounts: ").Append(Html(string.IsNullOrWhiteSpace(cfgAccountName) ? "all" : cfgAccountName.Trim())).Append("\n");
+            sb.Append("Accounts: ").Append(Html(AccountListText())).Append("\n");
             if (cfgMismatchSeconds > 0 && ResolveLeaderName().Length > 0 && AccountFilterHasSeveral())
                 sb.Append("Leader: ").Append(Html(ResolveLeaderName())).Append(" (other accounts follow)\n");
             sb.Append("Active: ").Append(Html(string.Join(", ", active.ToArray()))).Append("\n");
             sb.Append("EOD report: ").Append(eodTimeOfDay.ToString(@"hh\:mm")).Append(" ").Append(Html(eodTimeZone.Id)).Append("\n");
+            sb.Append("Times: NinjaTrader clock\n");
             sb.Append("/flatten: ").Append(cfgUseGlobalFlattenEverything ? "<b>ALL accounts</b>" : "tracked accounts only").Append("\n\n");
             sb.Append("<b>Connections</b>\n").Append(BuildConnectionsBlock());
             return sb.ToString().TrimEnd('\n');
@@ -1195,36 +1203,47 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         #region Fill alerts
 
-        // Partial fills of the same order inside FillAggregationMs are merged into one alert.
+        // Fills of the same instrument and side that arrive within FillAggregationMs are sent as one message,
+        // so a leader and its followers show up together, with each follower's price difference.
         private void QueueFillAlert(CbiExecution ex)
         {
-            string orderId = ex.Order != null && !string.IsNullOrEmpty(ex.Order.OrderId) ? ex.Order.OrderId : ex.ExecutionId;
-            if (string.IsNullOrEmpty(orderId))
-                orderId = Guid.NewGuid().ToString("N");
-            string key = AccountNameOf(ex) + "|" + orderId;
+            bool isBuy = ex.MarketPosition == MarketPosition.Long;
+            string key = ex.Instrument.FullName + "|" + (isBuy ? "B" : "S");
+            string account = AccountNameOf(ex);
 
             bool schedule = false;
             lock (fillLock)
             {
-                PendingFill pf;
-                if (!pendingFills.TryGetValue(key, out pf))
+                FillGroup g;
+                if (!pendingFills.TryGetValue(key, out g))
                 {
-                    pf = new PendingFill
+                    g = new FillGroup
                     {
-                        AccountName    = AccountNameOf(ex),
                         Instrument     = ex.Instrument,
                         InstrumentName = ex.Instrument.FullName,
-                        IsBuy          = ex.MarketPosition == MarketPosition.Long,
-                        ActionText     = DescribeAction(ex),
-                        OrderName      = ex.Order != null ? ex.Order.Name : string.Empty
+                        IsBuy          = isBuy,
+                        FirstTime      = ex.Time
                     };
-                    pendingFills[key] = pf;
+                    pendingFills[key] = g;
                     schedule = true;
                 }
-                pf.Quantity  += ex.Quantity;
-                pf.Notional  += ex.Price * ex.Quantity;
-                pf.FillCount += 1;
-                pf.LastTime   = ex.Time;
+                if (ex.Time < g.FirstTime)
+                    g.FirstTime = ex.Time;
+
+                FillLeg leg;
+                if (!g.Legs.TryGetValue(account, out leg))
+                {
+                    leg = new FillLeg
+                    {
+                        AccountName = account,
+                        ActionText  = DescribeAction(ex),
+                        OrderName   = ex.Order != null ? ex.Order.Name : string.Empty
+                    };
+                    g.Legs[account] = leg;
+                }
+                leg.Quantity  += ex.Quantity;
+                leg.Notional  += ex.Price * ex.Quantity;
+                leg.FillCount += 1;
             }
 
             if (schedule)
@@ -1241,14 +1260,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             try
             {
-                PendingFill pf;
+                FillGroup g;
                 lock (fillLock)
                 {
-                    if (!pendingFills.TryGetValue(key, out pf))
+                    if (!pendingFills.TryGetValue(key, out g))
                         return;
                     pendingFills.Remove(key);
                 }
-                EnqueueText(BuildFillMessage(pf));
+                EnqueueText(BuildFillMessage(g));
             }
             catch (Exception ex)
             {
@@ -1258,40 +1277,128 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void FlushPendingFills()
         {
-            List<PendingFill> pending;
+            List<FillGroup> pending;
             lock (fillLock)
             {
                 pending = pendingFills.Values.ToList();
                 pendingFills.Clear();
             }
-            foreach (PendingFill pf in pending)
-                EnqueueText(BuildFillMessage(pf));
+            foreach (FillGroup g in pending)
+                EnqueueText(BuildFillMessage(g));
         }
 
-        private string BuildFillMessage(PendingFill pf)
+        private string BuildFillMessage(FillGroup g)
         {
-            double avg = pf.Quantity > 0 ? pf.Notional / pf.Quantity : 0.0;
-            string price = pf.FillCount > 1
-                ? avg.ToString("0.######", CultureInfo.InvariantCulture) + " avg"
-                : FormatPriceSafe(pf.Instrument, avg);
+            string leaderName = ResolveLeaderName();
+            List<FillLeg> legs = g.Legs.Values
+                .OrderBy(l => l.AccountName.Equals(leaderName, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                .ThenBy(l => l.AccountName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
+            string side = g.IsBuy ? "BUY" : "SELL";
+            string icon = g.IsBuy ? EmGreen : EmRed;
             StringBuilder sb = new StringBuilder();
-            sb.Append(pf.IsBuy ? EmGreen : EmRed).Append(" <b>").Append(pf.IsBuy ? "BUY " : "SELL ")
-              .Append(Num(pf.Quantity)).Append(" \u00D7 ").Append(Html(pf.InstrumentName))
-              .Append("</b> @ ").Append(Html(price)).Append("\n");
-            sb.Append(Html(pf.AccountName)).Append(Sep).Append(TimeText(pf.LastTime)).Append("\n");
 
-            List<string> details = new List<string>();
-            if (!string.IsNullOrEmpty(pf.OrderName))
-                details.Add(Html(pf.OrderName));
-            if (!pf.ActionText.Equals("Buy", StringComparison.OrdinalIgnoreCase) && !pf.ActionText.Equals("Sell", StringComparison.OrdinalIgnoreCase))
-                details.Add(Html(pf.ActionText));
-            if (pf.FillCount > 1)
-                details.Add(Num(pf.FillCount) + " fills");
-            if (details.Count > 0)
-                sb.Append("Order: ").Append(string.Join(Sep, details.ToArray()));
+            // One account: the compact single-line headline.
+            if (legs.Count == 1)
+            {
+                FillLeg only = legs[0];
+                sb.Append(icon).Append(" <b>").Append(side).Append(" ").Append(Num(only.Quantity)).Append(" \u00D7 ")
+                  .Append(Html(g.InstrumentName)).Append("</b> @ ").Append(Html(LegPrice(g, only))).Append("\n");
+                sb.Append(Html(only.AccountName)).Append(Sep).Append(TimeText(g.FirstTime)).Append("\n");
 
+                List<string> details = new List<string>();
+                string name = CleanOrderName(only.OrderName);
+                if (name.Length > 0)
+                    details.Add(Html(name));
+                if (!only.ActionText.Equals("Buy", StringComparison.OrdinalIgnoreCase) && !only.ActionText.Equals("Sell", StringComparison.OrdinalIgnoreCase))
+                    details.Add(Html(only.ActionText));
+                if (only.FillCount > 1)
+                    details.Add(Num(only.FillCount) + " fills");
+                if (details.Count > 0)
+                    sb.Append("Order: ").Append(string.Join(Sep, details.ToArray()));
+
+                return sb.ToString().TrimEnd('\n');
+            }
+
+            // Several accounts (leader and followers): one headline, one line per account.
+            sb.Append(icon).Append(" <b>").Append(side).Append(" ").Append(Html(g.InstrumentName)).Append("</b>")
+              .Append(Sep).Append(TimeText(g.FirstTime)).Append("\n");
+
+            FillLeg leader = legs.FirstOrDefault(l => l.AccountName.Equals(leaderName, StringComparison.OrdinalIgnoreCase));
+            double tick = TickSizeOf(g.Instrument);
+
+            foreach (FillLeg leg in legs)
+            {
+                bool isLeader = leader != null && ReferenceEquals(leg, leader);
+                sb.Append("<b>").Append(Html(leg.AccountName)).Append("</b>");
+                if (isLeader)
+                    sb.Append(" (leader)");
+                sb.Append(Sep).Append(Num(leg.Quantity)).Append(" @ ").Append(Html(LegPrice(g, leg)));
+                if (leader != null && !isLeader && tick > 0)
+                    sb.Append(Sep).Append(DescribeDifference(g.IsBuy, LegAverage(leader), LegAverage(leg), tick));
+                if (leg.FillCount > 1)
+                    sb.Append(Sep).Append(Num(leg.FillCount)).Append(" fills");
+                sb.Append("\n");
+            }
             return sb.ToString().TrimEnd('\n');
+        }
+
+        private static double LegAverage(FillLeg leg)
+        {
+            return leg.Quantity > 0 ? leg.Notional / leg.Quantity : 0.0;
+        }
+
+        private static string LegPrice(FillGroup g, FillLeg leg)
+        {
+            double avg = LegAverage(leg);
+            return leg.FillCount > 1
+                ? avg.ToString("0.######", CultureInfo.InvariantCulture) + " avg"
+                : FormatPriceSafe(g.Instrument, avg);
+        }
+
+        private static double TickSizeOf(CbiInstrument instrument)
+        {
+            try
+            {
+                if (instrument != null && instrument.MasterInstrument != null)
+                    return instrument.MasterInstrument.TickSize;
+            }
+            catch (Exception) { }
+            return 0.0;
+        }
+
+        // Positive difference = the follower did worse than the leader (paid more on a buy, received less on a sell).
+        private static string DescribeDifference(bool isBuy, double leaderAvg, double followerAvg, double tick)
+        {
+            double ticks = (isBuy ? followerAvg - leaderAvg : leaderAvg - followerAvg) / tick;
+            double magnitude = Math.Round(Math.Abs(ticks), 1);
+            if (magnitude < 0.1)
+                return "same price";
+            return magnitude.ToString("0.#", CultureInfo.InvariantCulture) + (magnitude == 1.0 ? " tick " : " ticks ") + (ticks > 0 ? "worse" : "better");
+        }
+
+        // Hides internal copier order ids such as "73-007F6E72"; keeps readable names like "Entry" or "B27_Long".
+        private static string CleanOrderName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return string.Empty;
+            string n = name.Trim();
+            if (n.Length >= 8)
+            {
+                bool internalId = true;
+                foreach (char c in n)
+                {
+                    if (!(Uri.IsHexDigit(c) || c == '-'))
+                    {
+                        internalId = false;
+                        break;
+                    }
+                }
+                if (internalId)
+                    return string.Empty;
+            }
+            return n;
         }
 
         private static string DescribeAction(CbiExecution ex)
@@ -1590,21 +1697,33 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             sb.Append("<b>Connections</b>\n").Append(BuildConnectionsBlock()).Append("\n");
 
+            string leaderName = ResolveLeaderName();
+            bool several = AccountFilterHasSeveral();
             List<CbiAccount> accounts = SnapshotTrackedAccounts();
+
+            sb.Append("<b>Accounts</b>\n");
             if (accounts.Count == 0)
-                sb.Append("<b>Accounts</b>\n  none tracked yet\n");
+                sb.Append("  none tracked yet\n");
+
+            bool firstAccount = true;
             foreach (CbiAccount a in accounts)
             {
+                if (!firstAccount)
+                    sb.Append("\n");
+                firstAccount = false;
+
                 bool flat;
-                sb.Append("<b>").Append(Html(a.Name)).Append("</b>\n");
-                sb.Append(BuildPositionLines(a, out flat));
+                sb.Append("<b>").Append(Html(a.Name)).Append("</b>");
+                if (several && leaderName.Length > 0 && a.Name.Equals(leaderName, StringComparison.OrdinalIgnoreCase))
+                    sb.Append(" (leader)");
+                sb.Append("\n").Append(BuildPositionLines(a, out flat));
                 sb.Append("  P&amp;L: realized ").Append(Money(SafeAccountValue(a, AccountItem.RealizedProfitLoss)))
                   .Append(Sep).Append("open ").Append(Money(SafeAccountValue(a, AccountItem.UnrealizedProfitLoss))).Append("\n");
             }
 
             string copyLine = BuildCopyStatusLine();
             if (copyLine.Length > 0)
-                sb.Append(copyLine);
+                sb.Append("\n").Append(copyLine);
 
             sb.Append("\n<b>Strategies</b>\n").Append(BuildStrategiesBlock());
             sb.Append(BuildFeedLines());
@@ -1940,7 +2059,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if ((DateTime.UtcNow - msg.CreatedUtc).TotalSeconds > 60)
             {
                 text = EmClock + " <i>Delayed alert, raised at "
-                    + msg.CreatedUtc.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture) + "</i>\n" + text;
+                    + TimeText(NtNow() - (DateTime.UtcNow - msg.CreatedUtc)) + "</i>\n" + text;
             }
 
             try
@@ -2290,9 +2409,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 StringBuilder sb = new StringBuilder();
                 sb.Append(clean ? EmInfo + " <b>NINJATRADER RESTARTED</b>" : EmWarn + " <b>NINJATRADER WENT DOWN</b>")
                   .Append(Sep).Append("down ").Append(FormatDuration(gap)).Append("\n");
-                sb.Append("Last alive ").Append(lastAliveUtc.ToLocalTime().ToString("ddd HH:mm:ss", CultureInfo.InvariantCulture))
-                  .Append(Sep).Append("back ").Append(DateTime.Now.ToString("ddd HH:mm:ss", CultureInfo.InvariantCulture))
-                  .Append(" (PC time)\n");
+                DateTime nowNt = NtNow();
+                DateTime lastAliveNt = nowNt - gap;
+                sb.Append("Last alive ").Append(lastAliveNt.ToString("ddd HH:mm:ss", CultureInfo.InvariantCulture))
+                  .Append(Sep).Append("back ").Append(nowNt.ToString("ddd HH:mm:ss", CultureInfo.InvariantCulture))
+                  .Append(" (NinjaTrader time)\n");
                 sb.Append(clean
                     ? "Exit: normal (closed or restarted)\n"
                     : "Exit: <b>abnormal</b> (crash, forced kill, power loss, or no shutdown handler)\n");
@@ -2932,6 +3053,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             return filter.Split(',')[0].Trim();
         }
 
+        private string AccountListText()
+        {
+            string filter = (cfgAccountName ?? string.Empty).Trim();
+            if (filter.Length == 0 || filter == "*")
+                return "all";
+            return string.Join(", ", filter.Split(',').Select(part => part.Trim()).Where(part => part.Length > 0).ToArray());
+        }
+
         private bool AccountFilterHasSeveral()
         {
             string filter = (cfgAccountName ?? string.Empty).Trim();
@@ -3125,7 +3254,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 string plain = System.Text.RegularExpressions.Regex.Replace(text, "<[^>]+>", string.Empty)
                     .Replace("&amp;", "&").Replace("&lt;", "<").Replace("&gt;", ">")
                     .Replace("\r", string.Empty).Replace("\n", " | ");
-                string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "  " + plain + Environment.NewLine;
+                string line = NtNow().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "  " + plain + Environment.NewLine;
 
                 lock (logLock)
                 {
@@ -3222,7 +3351,11 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private static string ChannelText(ConnectionStatus status)
         {
-            return status == ConnectionStatus.Connected ? EmOk : EmWarn + " " + status;
+            if (status == ConnectionStatus.Connected)
+                return EmOk;
+            if (status == ConnectionStatus.Connecting || status == ConnectionStatus.Disconnecting)
+                return EmWait + " " + status;
+            return EmWarn + " " + status;
         }
 
         private static string Html(string s)

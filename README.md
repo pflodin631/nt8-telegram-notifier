@@ -30,9 +30,10 @@ Telegram alerts and a small remote-control surface for **NinjaTrader 8**, as a s
 Example messages:
 
 ```
-BUY 2 x MNQ 12-26 @ 25120.50
-Sim101 · 14:32:07
-Order: Entry · 3 fills
+🟢 BUY MNQ DEC26 · 10:42:07
+MFFUEVREOD…001 (leader) · 3 @ 29411.00
+MFFUEVREOD…002 · 3 @ 29410.00 · 4 ticks better
+MFFUEVREOD…003 · 3 @ 29410.00 · 4 ticks better
 
 CONNECTION LOST
 MyConnection · orders + data

@@ -1,4 +1,4 @@
-# NT8 Direct Telegram Notifier
+# NT8 Direct Telegram Notifier / Share Service
 
 Telegram alerts and a small remote-control surface for **NinjaTrader 8**, as a single-file AddOn. It talks straight to the Telegram Bot API over HTTPS: no NinjaTrader Share Services, no third-party servers, no extra DLLs.
 

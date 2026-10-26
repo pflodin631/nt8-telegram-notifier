@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0 (2026-10-26)
+
+Safety checks, account-level risk and targeted commands.
+
+- Unprotected-position alert (position without a working stop; off by default).
+- Orphan exit orders alert (account flat, stop/target-type orders still working).
+- Stuck-order alert (Submitted / change pending / cancel pending too long).
+- Position limit alert (`MaxPositionContracts`).
+- Risk buffer: alerts as Net Liquidation approaches a drawdown floor, "below floor" and recovery notices, optional per-account auto-flatten (`RiskAutoFlatten`, off by default).
+- `/floor` command to show and set floors (saved across restarts); `/status` shows net liquidation, floor and buffer.
+- `/flatten [account]` and `/cancel [account]`; the confirm buttons name the account.
+- NinjaTrader CPU, memory and disk alerts; CPU, memory and disk shown in `/diag`.
+- Fixed: falling below the floor is now its own, tightest alert level.
+
 ## 0.1.2 (2026-10-26)
 
 - Commands arrive almost instantly: Telegram long polling replaces polling every few seconds.
@@ -19,9 +33,9 @@
 
 - Fills of one instrument and side are grouped into one message, with each follower's price difference from the leader in ticks.
 - Internal copier order IDs are hidden from fill alerts.
-- All times now use the NinjaTrader clock, including the restart report and the alert log.
+- All times use the NinjaTrader clock, including the restart report and the alert log.
 - `/status` is easier to read: Accounts header, spacing, leader marked.
-- "Connecting" shows ⏳ instead of ⚠️.
+- "Connecting" shows an hourglass instead of a warning sign.
 
 ## 0.1.0 (2026-10-26) - first public beta
 

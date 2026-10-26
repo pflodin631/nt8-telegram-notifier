@@ -30,9 +30,11 @@ using CbiPosition = NinjaTrader.Cbi.Position;
 //
 //  Alerts:    fills, connection loss/restore (orders and data), UI freeze, rejected orders,
 //             order-rate spikes, strategy disabled, stale market data, trade-copier mismatch
-//             (leader vs followers), restart/crash detection, end-of-day summary.
+//             (leader vs followers), unprotected positions, orphan and stuck orders, position limit,
+//             drawdown-floor buffer, NinjaTrader CPU/memory/disk, restart/crash detection, end-of-day summary.
 //             Every alert is also appended to Documents\NinjaTrader 8\DirectTelegramNotifier.log.
-//  Commands:  /status  /flatten  /copy  /eod  /diag  /simulate  /version  /help   (only from AuthorizedChatID)
+//  Commands:  /status  /flatten [account]  /cancel [account]  /floor  /copy  /eod  /diag  /simulate  /version  /help
+//             (accepted only from AuthorizedChatID)
 //  Optional:  external heartbeat ping (dead-man's switch, e.g. Healthchecks.io).
 //
 //  Configuration: Documents\NinjaTrader 8\DirectTelegramNotifier.config (template created on
@@ -45,7 +47,7 @@ using CbiPosition = NinjaTrader.Cbi.Position;
 //     ignored, so a stale /flatten never runs after a restart or reboot.
 //   * /flatten covers the tracked account(s) only, unless UseGlobalFlattenEverything=true.
 //
-//  Version 0.1.2, MIT License. Not affiliated with or endorsed by NinjaTrader or Telegram.
+//  Version 0.2.0, MIT License. Not affiliated with or endorsed by NinjaTrader or Telegram.
 //  Provided as is, without warranty. Automated trading and remote order control carry risk.
 //
 //  Written in C# 5 syntax so it compiles on any NinjaScript compiler version.
@@ -83,7 +85,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const int    FlattenConfirmSec    = 30;
         private const int    ClockDriftAlertSec   = 15;
         private const int    ReentryWindowSec     = 90;
-        private const string AddOnVersion        = "0.1.2";
+        private const string AddOnVersion        = "0.2.0";
         private const string HeartbeatFileName    = "DirectTelegramNotifier.heartbeat";
         private const string Sep                  = " \u00B7 ";
 
@@ -275,6 +277,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         private bool   cfgFlattenConfirm = false;
         private bool   cfgSilentRoutine = false;
         private bool   cfgEnableFillCsv = true;
+        private int    cfgProtectiveCheckSec = 0;
+        private int    cfgOrphanOrderSec = 20;
+        private string cfgOrphanOrderNames = "Stop,Target";
+        private int    cfgStuckOrderSec = 30;
+        private int    cfgMaxPositionContracts = 0;
+        private double cfgRiskFloor = double.NaN;
+        private bool   cfgRiskAutoFlatten = false;
+        private double cfgRiskFlattenBuffer = 150.0;
+        private int    cfgCpuAlertPercent = 90;
+        private int    cfgCpuAlertSeconds = 180;
+        private int    cfgMemoryAlertMb = 0;
+        private int    cfgDiskAlertMb = 2000;
         private bool   cfgEnableOrderRejectAlerts = true;
         private int    cfgRunawayMaxOrders = 30;
         private int    cfgRunawayWindowSec = 60;
@@ -369,6 +383,33 @@ namespace NinjaTrader.NinjaScript.AddOns
         private bool reentryAlerted;
         private DateTime lastPruneUtc = DateTime.UtcNow;
 
+        private readonly object episodeLock = new object();
+        private readonly Dictionary<string, DateTime> episodeStart = new Dictionary<string, DateTime>();
+        private readonly HashSet<string> episodeAlerted = new HashSet<string>();
+        private readonly Dictionary<string, StateStamp> orderStateSince = new Dictionary<string, StateStamp>();     // guarded by orderLock
+        private readonly HashSet<string> stuckAlerted = new HashSet<string>();                                       // guarded by orderLock
+
+        private readonly object riskLock = new object();
+        private readonly Dictionary<string, double> riskFloors = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);       // from the config file
+        private readonly Dictionary<string, double> floorOverrides = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);  // from /floor ("*" = all)
+        private readonly Dictionary<string, double> riskLevel = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, int> riskStrikes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DateTime> lastAutoFlatten = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private List<double> riskBuffers = new List<double>();
+        private bool riskReadProblemReported;
+
+        private DateTime lastCpuSampleUtc = DateTime.MinValue;
+        private double lastCpuSeconds;
+        private double lastCpuPercent;
+        private DateTime cpuHighSince = DateTime.MinValue;
+        private DateTime lastCpuAlertUtc = DateTime.MinValue;
+        private int lastMemoryMb;
+        private DateTime lastMemAlertUtc = DateTime.MinValue;
+        private long lastDiskFreeMb = -1;
+        private DateTime lastDiskCheckUtc = DateTime.MinValue;
+        private DateTime lastDiskAlertUtc = DateTime.MinValue;
+        private string confirmFilter = string.Empty;
+
         private readonly object confirmLock = new object();
         private string confirmToken = string.Empty;
         private DateTime confirmExpiresUtc = DateTime.MinValue;
@@ -449,6 +490,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             alertLogPath   = AlertLogPath();
             startupGapNote = ReadPreviousHeartbeat();
             WriteHeartbeatFile(false);
+            LoadFloorOverrides();
 
             try
             {
@@ -496,6 +538,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (cfgMismatchSeconds > 0 && ResolveLeaderName().Length > 0 && AccountFilterHasSeveral()) active.Add("copy check");
             if (cfgRunawayMaxOrders > 0)    active.Add("order-rate " + Num(cfgRunawayMaxOrders) + "/" + Num(cfgRunawayWindowSec) + "s");
             if (!string.IsNullOrEmpty(cfgHeartbeatUrl)) active.Add("heartbeat");
+            if (cfgProtectiveCheckSec > 0) active.Add("stop check " + Num(cfgProtectiveCheckSec) + "s");
+            if (cfgOrphanOrderSec > 0)     active.Add("orphan orders " + Num(cfgOrphanOrderSec) + "s");
+            if (cfgStuckOrderSec > 0)      active.Add("stuck orders " + Num(cfgStuckOrderSec) + "s");
+            if (cfgMaxPositionContracts > 0) active.Add("position limit " + Num(cfgMaxPositionContracts));
+            if (!double.IsNaN(cfgRiskFloor) || riskFloors.Count > 0 || floorOverrides.Count > 0) active.Add(cfgRiskAutoFlatten ? "risk floor + auto-flatten" : "risk floor");
+            if (cfgCpuAlertPercent > 0 || cfgDiskAlertMb > 0 || cfgMemoryAlertMb > 0) active.Add("machine health");
 
             StringBuilder sb = new StringBuilder();
             sb.Append(EmRocket).Append(" <b>Notifier online</b>").Append(Sep).Append("v").Append(AddOnVersion).Append("\n");
@@ -600,6 +648,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 CheckStaleData();
                 CheckCopyMismatch();
                 PruneTrackingSets();
+                CheckExposure();
+                CheckRisk();
+                CheckMachineHealth();
                 CheckEndOfDay();
             }
             catch (Exception ex)
@@ -686,6 +737,37 @@ namespace NinjaTrader.NinjaScript.AddOns
                  + "# MismatchSeconds: alert when followers stay out of sync with the leader this long. 0 = off.\r\n"
                  + "MismatchSeconds=20\r\n"
                  + "\r\n"
+                 + "# --- Safety checks ---\r\n"
+                 + "# ProtectiveCheckSeconds: alert when an open position has no working stop order for this long. 0 = off.\r\n"
+                 + "# Turn it on only if your strategies place real stop orders (not internal stop logic).\r\n"
+                 + "ProtectiveCheckSeconds=0\r\n"
+                 + "# OrphanOrderSeconds: alert when an account is flat but exit-type orders (name contains one of OrphanOrderNames) keep working this long. 0 = off.\r\n"
+                 + "OrphanOrderSeconds=20\r\n"
+                 + "OrphanOrderNames=Stop,Target\r\n"
+                 + "# StuckOrderSeconds: alert when an order sits in Submitted / change pending / cancel pending this long. 0 = off.\r\n"
+                 + "StuckOrderSeconds=30\r\n"
+                 + "# MaxPositionContracts: alert when an account holds more than this many contracts in total. 0 = off.\r\n"
+                 + "MaxPositionContracts=0\r\n"
+                 + "\r\n"
+                 + "# --- Risk buffer (prop-firm drawdown floor) ---\r\n"
+                 + "# RiskFloor: the Net Liquidation value at which an account fails, from your firm's rules. Blank = off.\r\n"
+                 + "# Most trailing floors move: update them with the /floor command. A per-account floor overrides it, e.g.  RiskFloor:MyAccount001=48500\r\n"
+                 + "RiskFloor=\r\n"
+                 + "# RiskBufferAlerts: alert as Net Liquidation comes within these many dollars of the floor.\r\n"
+                 + "RiskBufferAlerts=1500,750,300\r\n"
+                 + "# RiskAutoFlatten: true = flatten an account that gets within RiskFlattenBuffer dollars of its floor. Test on Sim first.\r\n"
+                 + "RiskAutoFlatten=false\r\n"
+                 + "RiskFlattenBuffer=150\r\n"
+                 + "\r\n"
+                 + "# --- Machine health (the NinjaTrader process) ---\r\n"
+                 + "# CpuAlertPercent / CpuAlertSeconds: alert when NinjaTrader's CPU stays at or above this level this long. 0 = off.\r\n"
+                 + "CpuAlertPercent=90\r\n"
+                 + "CpuAlertSeconds=180\r\n"
+                 + "# MemoryAlertMB: alert when NinjaTrader uses more memory than this. 0 = off.\r\n"
+                 + "MemoryAlertMB=0\r\n"
+                 + "# DiskAlertMB: alert when the drive holding the config folder has less free space than this. 0 = off.\r\n"
+                 + "DiskAlertMB=2000\r\n"
+                 + "\r\n"
                  + "# --- Convenience ---\r\n"
                  + "# FlattenConfirm: true = /flatten first shows Confirm / Cancel buttons (expire after 30 s). false = flatten immediately.\r\n"
                  + "FlattenConfirm=false\r\n"
@@ -751,6 +833,33 @@ namespace NinjaTrader.NinjaScript.AddOns
             cfgFlattenConfirm             = GetBool(kv, "FlattenConfirm", false);
             cfgSilentRoutine              = GetBool(kv, "SilentRoutineAlerts", false);
             cfgEnableFillCsv              = GetBool(kv, "EnableFillCsv", true);
+            cfgProtectiveCheckSec         = Math.Max(0, GetInt(kv, "ProtectiveCheckSeconds", 0));
+            cfgOrphanOrderSec             = Math.Max(0, GetInt(kv, "OrphanOrderSeconds", 20));
+            cfgOrphanOrderNames           = GetString(kv, "OrphanOrderNames", "Stop,Target");
+            cfgStuckOrderSec              = Math.Max(0, GetInt(kv, "StuckOrderSeconds", 30));
+            cfgMaxPositionContracts       = Math.Max(0, GetInt(kv, "MaxPositionContracts", 0));
+            cfgRiskFloor                  = ParseOptionalDouble(GetString(kv, "RiskFloor", string.Empty));
+            riskBuffers                   = ParseDollarList(GetString(kv, "RiskBufferAlerts", "1500,750,300"));
+            cfgRiskAutoFlatten            = GetBool(kv, "RiskAutoFlatten", false);
+            cfgRiskFlattenBuffer          = Math.Max(0.0, GetDouble(kv, "RiskFlattenBuffer", 150.0));
+            cfgCpuAlertPercent            = Math.Max(0, Math.Min(100, GetInt(kv, "CpuAlertPercent", 90)));
+            cfgCpuAlertSeconds            = Math.Max(30, GetInt(kv, "CpuAlertSeconds", 180));
+            cfgMemoryAlertMb              = Math.Max(0, GetInt(kv, "MemoryAlertMB", 0));
+            cfgDiskAlertMb                = Math.Max(0, GetInt(kv, "DiskAlertMB", 2000));
+
+            lock (riskLock)
+            {
+                riskFloors.Clear();
+                foreach (KeyValuePair<string, string> pair in kv)
+                {
+                    if (!pair.Key.StartsWith("RiskFloor:", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    double perAccount = ParseOptionalDouble(pair.Value);
+                    string account = pair.Key.Substring("RiskFloor:".Length).Trim();
+                    if (!double.IsNaN(perAccount) && account.Length > 0)
+                        riskFloors[account] = perAccount;
+                }
+            }
             cfgEnableOrderRejectAlerts    = GetBool(kv, "EnableOrderRejectAlerts", true);
             cfgRunawayMaxOrders           = Math.Max(0, GetInt(kv, "RunawayMaxOrders", 30));
             cfgRunawayWindowSec           = Math.Max(10, GetInt(kv, "RunawayWindowSec", 60));
@@ -1675,9 +1784,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return;
             }
 
-            string command = ParseCommand(JsonString(message, "text"));
+            string messageText = JsonString(message, "text");
+            string command = ParseCommand(messageText);
             if (command == null)
                 return;
+            string argument = ParseArgument(messageText);
 
             WriteOutput("Remote command received: " + command);
 
@@ -1688,9 +1799,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                     break;
                 case "/flatten":
                     if (cfgFlattenConfirm)
-                        RequestFlattenConfirmation();
+                        RequestFlattenConfirmation(argument);
                     else
-                        await ExecuteFlattenAsync();
+                        await ExecuteFlattenAsync(argument);
+                    break;
+                case "/cancel":
+                    await ExecuteCancelAsync(argument);
+                    break;
+                case "/floor":
+                    EnqueueQuiet(HandleFloorCommand(argument));
                     break;
                 case "/version":
                     EnqueueQuiet(EmInfo + " DirectTelegramNotifier v" + AddOnVersion);
@@ -1733,8 +1850,23 @@ namespace NinjaTrader.NinjaScript.AddOns
             return t.ToLowerInvariant();
         }
 
-        private async Task ExecuteFlattenAsync()
+        private Task ExecuteFlattenAsync()
         {
+            return ExecuteFlattenAsync(null);
+        }
+
+        // filter = blank for every tracked account, or part of an account name for just that account.
+        private async Task ExecuteFlattenAsync(string filter)
+        {
+            string problem;
+            List<CbiAccount> targets = ResolveAccounts(filter, out problem);
+            if (targets == null)
+            {
+                EnqueueQuiet(EmInfo + " " + Html(problem));
+                return;
+            }
+            bool targeted = !string.IsNullOrWhiteSpace(filter);
+
             lastFlattenUtc = DateTime.UtcNow;
             reentryAlerted = false;
 
@@ -1743,19 +1875,18 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             try
             {
-                if (cfgUseGlobalFlattenEverything)
+                if (cfgUseGlobalFlattenEverything && !targeted)
                 {
                     CbiAccount.FlattenEverything();
                     sb.Append("Scope: <b>ALL accounts</b> (FlattenEverything)\n");
                 }
                 else
                 {
-                    List<CbiAccount> accounts = SnapshotTrackedAccounts();
-                    sb.Append("Scope: tracked accounts\n");
-                    if (accounts.Count == 0)
+                    sb.Append("Scope: ").Append(targeted ? Html(targets[0].Name) : "tracked accounts").Append("\n");
+                    if (targets.Count == 0)
                         sb.Append("No tracked accounts, nothing was sent.\n");
 
-                    foreach (CbiAccount a in accounts)
+                    foreach (CbiAccount a in targets)
                     {
                         List<CbiInstrument> instruments = CollectExposedInstruments(a);
                         if (instruments.Count == 0)
@@ -1778,13 +1909,113 @@ namespace NinjaTrader.NinjaScript.AddOns
             await Task.Delay(FlattenVerifyDelayMs);
 
             bool allFlat;
-            string check = BuildPostFlattenCheck(out allFlat);
+            string check = BuildPostFlattenCheck(targets, out allFlat);
             sb.Append("\n").Append(allFlat ? EmOk + " <b>Flat</b>" : EmWarn + " <b>Exposure remains</b>")
               .Append(" after ").Append((FlattenVerifyDelayMs / 1000.0).ToString("0.0", CultureInfo.InvariantCulture)).Append("s\n")
               .Append(check);
             sb.Append("<i>Enabled strategies are not disabled and can re-enter.</i>");
 
             EnqueueText(sb.ToString());
+        }
+
+        // Cancels working orders (no flatten). Uses Account.Cancel through reflection so a NinjaTrader API difference cannot break the compile.
+        private async Task ExecuteCancelAsync(string filter)
+        {
+            string problem;
+            List<CbiAccount> targets = ResolveAccounts(filter, out problem);
+            if (targets == null)
+            {
+                EnqueueQuiet(EmInfo + " " + Html(problem));
+                return;
+            }
+
+            StringBuilder sb = new StringBuilder();
+            sb.Append(EmStop).Append(" <b>CANCEL SENT</b>\n");
+            sb.Append("Scope: ").Append(string.IsNullOrWhiteSpace(filter) ? "tracked accounts" : Html(targets[0].Name)).Append("\n");
+
+            foreach (CbiAccount a in targets)
+            {
+                List<CbiOrder> working = WorkingOrders(a);
+                if (working.Count == 0)
+                {
+                    sb.Append(Html(a.Name)).Append(": no working orders\n");
+                    continue;
+                }
+
+                string how;
+                bool ok = TryCancelOrders(a, working, out how);
+                sb.Append(Html(a.Name)).Append(": ")
+                  .Append(ok ? Num(working.Count) + (working.Count == 1 ? " order" : " orders") : EmWarn + " failed (" + Html(how) + ")").Append("\n");
+            }
+
+            await Task.Delay(2000);
+
+            int remaining = 0;
+            foreach (CbiAccount a in targets)
+                remaining += WorkingOrders(a).Count;
+            sb.Append("\n").Append(remaining == 0 ? EmOk + " <b>No working orders left</b>" : EmWarn + " <b>" + Num(remaining) + " working order(s) remain</b>")
+              .Append("\n<i>Positions are untouched; use /flatten to close them.</i>");
+
+            EnqueueText(sb.ToString());
+        }
+
+        private static List<CbiOrder> WorkingOrders(CbiAccount a)
+        {
+            lock (a.Orders)
+                return a.Orders.Where(o => o != null && IsWorkingState(o.OrderState)).ToList();
+        }
+
+        private static bool TryCancelOrders(CbiAccount a, List<CbiOrder> orders, out string how)
+        {
+            how = null;
+            try
+            {
+                System.Reflection.MethodInfo m = typeof(CbiAccount).GetMethod("Cancel", new Type[] { typeof(IEnumerable<CbiOrder>) });
+                if (m == null)
+                {
+                    how = "Account.Cancel not found";
+                    return false;
+                }
+                m.Invoke(a, new object[] { orders });
+                return true;
+            }
+            catch (Exception ex)
+            {
+                how = Truncate(Describe(ex), 120);
+                return false;
+            }
+        }
+
+        // Finds tracked accounts by exact name or by a unique part of the name ("002"). Blank filter = all tracked accounts.
+        private List<CbiAccount> ResolveAccounts(string filter, out string problem)
+        {
+            problem = null;
+            List<CbiAccount> all = SnapshotTrackedAccounts();
+            if (string.IsNullOrWhiteSpace(filter))
+                return all;
+
+            string f = filter.Trim();
+            List<CbiAccount> exact = all.Where(a => a.Name.Equals(f, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (exact.Count == 1)
+                return exact;
+
+            List<CbiAccount> part = all.Where(a => a.Name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0).ToList();
+            if (part.Count == 1)
+                return part;
+
+            problem = part.Count == 0
+                ? "No tracked account matches '" + f + "'."
+                : "'" + f + "' matches several accounts (" + string.Join(", ", part.Select(a => a.Name).ToArray()) + "). Be more specific.";
+            return null;
+        }
+
+        private static string ParseArgument(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return string.Empty;
+            string t = text.Trim();
+            int space = t.IndexOfAny(new[] { ' ', '\n', '\t', '\r' });
+            return space > 0 ? t.Substring(space + 1).Trim() : string.Empty;
         }
 
         private List<CbiInstrument> CollectExposedInstruments(CbiAccount a)
@@ -1812,11 +2043,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             return map.Values.ToList();
         }
 
-        private string BuildPostFlattenCheck(out bool allFlat)
+        private string BuildPostFlattenCheck(List<CbiAccount> accounts, out bool allFlat)
         {
             allFlat = true;
             StringBuilder sb = new StringBuilder();
-            foreach (CbiAccount a in SnapshotTrackedAccounts())
+            foreach (CbiAccount a in accounts)
             {
                 bool accountFlat;
                 string lines = BuildPositionLines(a, out accountFlat);
@@ -1830,9 +2061,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         private string BuildHelpText()
         {
             return EmInfo + " <b>Commands</b>\n"
-                + "/status \u2014 connections, positions, strategies\n"
-                + "/flatten \u2014 close positions and cancel working orders ("
-                + (cfgUseGlobalFlattenEverything ? "ALL accounts" : "tracked accounts") + (cfgFlattenConfirm ? ", asks to confirm" : string.Empty) + ")\n"
+                + "/status \u2014 connections, positions, strategies, risk buffer\n"
+                + "/flatten [account] \u2014 close positions and cancel orders ("
+                + (cfgUseGlobalFlattenEverything ? "ALL accounts" : "tracked accounts") + (cfgFlattenConfirm ? ", asks to confirm" : string.Empty) + "). Add part of an account name for just that account\n"
+                + "/cancel [account] \u2014 cancel working orders, keep positions\n"
+                + "/floor [amount] [account] \u2014 show or set drawdown floors (/floor 48250, /floor 002 48500, /floor clear)\n"
                 + "/copy \u2014 follower fills vs the leader today\n"
                 + "/eod \u2014 preview the end-of-day report\n"
                 + "/diag \u2014 health and diagnostics\n"
@@ -1874,6 +2107,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                 sb.Append("\n").Append(BuildPositionLines(a, out flat));
                 sb.Append("  P&amp;L: realized ").Append(Money(SafeAccountValue(a, AccountItem.RealizedProfitLoss)))
                   .Append(Sep).Append("open ").Append(Money(SafeAccountValue(a, AccountItem.UnrealizedProfitLoss))).Append("\n");
+
+                double statusFloor = FloorFor(a.Name);
+                if (!double.IsNaN(statusFloor))
+                {
+                    double statusNetLiq = NetLiquidationOf(a);
+                    if (!double.IsNaN(statusNetLiq))
+                        sb.Append("  Net liq ").Append(N2(statusNetLiq)).Append(Sep).Append("floor ").Append(N2(statusFloor))
+                          .Append(Sep).Append("<b>").Append(N2(statusNetLiq - statusFloor)).Append(" buffer</b>\n");
+                }
 
                 lock (statsLock)
                 {
@@ -2727,6 +2969,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                             : o.OrderId);
                         present.Add(id);
 
+                        if (cfgStuckOrderSec > 0)
+                            CheckStuckOrder(a, o, id);
+
                         bool firstSeen;
                         bool rejectIsNew = false;
                         lock (orderLock)
@@ -3475,21 +3720,32 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         #region Buttons, clock check and diagnostics helpers
 
-        // Optional safety step: /flatten shows Confirm / Cancel buttons. Only your own taps count and a tap is single-use.
-        private void RequestFlattenConfirmation()
+        private void RequestFlattenConfirmation(string filter)
         {
+            string problem;
+            List<CbiAccount> targets = ResolveAccounts(filter, out problem);
+            if (targets == null)
+            {
+                EnqueueQuiet(EmInfo + " " + Html(problem));
+                return;
+            }
+            bool targeted = !string.IsNullOrWhiteSpace(filter);
+
             string token = Guid.NewGuid().ToString("N").Substring(0, 8);
             lock (confirmLock)
             {
                 confirmToken = token;
+                confirmFilter = targeted ? filter.Trim() : string.Empty;
                 confirmExpiresUtc = DateTime.UtcNow.AddSeconds(FlattenConfirmSec);
             }
 
             string markup = "{\"inline_keyboard\":[[{\"text\":\"" + EmStop + " Flatten now\",\"callback_data\":\"flat:" + token
                 + "\"},{\"text\":\"Cancel\",\"callback_data\":\"cancel:" + token + "\"}]]}";
 
+            string scope = targeted ? Html(targets[0].Name)
+                : (cfgUseGlobalFlattenEverything ? "<b>ALL accounts</b>" : "tracked accounts");
             EnqueueWithButtons(EmWarn + " <b>Confirm flatten?</b>\n"
-                + "Scope: " + (cfgUseGlobalFlattenEverything ? "<b>ALL accounts</b>" : "tracked accounts") + "\n"
+                + "Scope: " + scope + "\n"
                 + "Buttons expire in " + Num(FlattenConfirmSec) + "s.", markup);
         }
 
@@ -3507,11 +3763,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             string token = isFlatten ? data.Substring(5) : (isCancel ? data.Substring(7) : string.Empty);
 
             bool valid = false;
+            string filter = string.Empty;
             lock (confirmLock)
             {
                 if (token.Length > 0 && token == confirmToken)
                 {
                     valid = DateTime.UtcNow <= confirmExpiresUtc;
+                    filter = confirmFilter;
                     confirmToken = string.Empty;                     // single use
                 }
             }
@@ -3519,7 +3777,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (isFlatten && valid)
             {
                 await AnswerCallbackAsync(id, "Flattening...");
-                await ExecuteFlattenAsync();
+                await ExecuteFlattenAsync(filter);
             }
             else if (isCancel && valid)
             {
@@ -3893,7 +4151,6 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
-        // Orders that NinjaTrader no longer lists can never come back, so their ids can be forgotten.
         private void PruneOrderIds(string accountName, HashSet<string> present)
         {
             string prefix = accountName + "|";
@@ -3906,6 +4163,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 List<string> goneRejected = rejectedAlerted.Where(id2 => id2.StartsWith(prefix, StringComparison.Ordinal) && !present.Contains(id2)).ToList();
                 foreach (string key in goneRejected)
                     rejectedAlerted.Remove(key);
+
+                List<string> goneStamps = orderStateSince.Keys.Where(id3 => id3.StartsWith(prefix, StringComparison.Ordinal) && !present.Contains(id3)).ToList();
+                foreach (string key in goneStamps)
+                {
+                    orderStateSince.Remove(key);
+                    stuckAlerted.Remove(key);
+                }
             }
         }
 
@@ -3946,6 +4210,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
             }
             catch (Exception) { }
+
+            sb.Append("  NinjaTrader CPU ").Append(lastCpuSampleUtc == DateTime.MinValue ? "n/a" : Math.Round(lastCpuPercent).ToString("0", CultureInfo.InvariantCulture) + "%")
+              .Append(Sep).Append("disk free ").Append(lastDiskFreeMb < 0 ? "n/a" : N2(lastDiskFreeMb / 1024.0) + " GB").Append("\n");
 
             sb.Append("\n<b>Settings</b>\n");
             sb.Append("  EOD ").Append(eodTimeOfDay.ToString(@"hh\:mm")).Append(Sep)
@@ -4034,7 +4301,711 @@ namespace NinjaTrader.NinjaScript.AddOns
             EnqueueText(MsgRestart(false, TimeSpan.FromSeconds(372), now.AddSeconds(-372), now) + tag);
             EnqueueText(MsgClockDrift(21) + tag);
 
+            EnqueueText(MsgUnprotected(leader, "MNQ DEC26", 3, 1, TimeSpan.FromSeconds(24)) + tag);
+            EnqueueText(MsgOrphan(leader, "MNQ DEC26", 2, "ProfitTarget, Stop1", TimeSpan.FromSeconds(31)) + tag);
+            EnqueueText(MsgStuck(leader, "MNQ DEC26", "Sell", "StopMarket", "3", "Submitted", TimeSpan.FromSeconds(45)) + tag);
+            EnqueueText(MsgPositionLimit(leader, 12, 10) + tag);
+            EnqueueText(MsgRiskBuffer(leader, 48730.10, 48000.0, 730.10, 750.0) + tag);
+            EnqueueQuiet(MsgRiskRecovered(leader, 2296.10) + tag);
+            EnqueueText(MsgAutoFlatten(leader, 48120.50, 48000.0, 120.50, "MNQ DEC26") + tag);
+            EnqueueText(MsgCpuHigh(94.0, TimeSpan.FromSeconds(195)) + tag);
+            EnqueueText(MsgDiskLow("C:", 1480) + tag);
+
             EnqueueQuiet(EmOk + " <b>Simulation finished</b>");
+        }
+
+        #endregion
+
+        #region Exposure, risk and machine checks
+
+        // A condition that has to hold for a while before it is worth an alert; alerts once per episode.
+        private sealed class Condition
+        {
+            public string Key;
+            public string Kind;
+            public int Seconds;
+            public string Instrument;
+            public int Net;
+            public int Covered;
+            public int Count;
+            public string Names;
+            public TimeSpan Elapsed;
+        }
+
+        private sealed class StateStamp
+        {
+            public string State;
+            public DateTime Since;
+        }
+
+        // ---- Unprotected positions, orphan exit orders, position limit ----
+
+        private void CheckExposure()
+        {
+            if (cfgProtectiveCheckSec <= 0 && cfgOrphanOrderSec <= 0 && cfgMaxPositionContracts <= 0)
+                return;
+            try
+            {
+                DateTime now = DateTime.UtcNow;
+                string[] tokens = (cfgOrphanOrderNames ?? string.Empty).Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(t => t.Trim()).Where(t => t.Length > 0).ToArray();
+                List<string> messages = new List<string>();
+
+                foreach (CbiAccount a in SnapshotTrackedAccounts())
+                {
+                    Dictionary<string, int> nets = NetPositions(a);
+                    List<CbiOrder> working = WorkingOrders(a).Where(o => o.Instrument != null).ToList();
+
+                    HashSet<string> instruments = new HashSet<string>(nets.Keys, StringComparer.OrdinalIgnoreCase);
+                    foreach (CbiOrder w in working)
+                        instruments.Add(w.Instrument.FullName);
+
+                    List<Condition> active = new List<Condition>();
+                    foreach (string inst in instruments)
+                    {
+                        int net;
+                        nets.TryGetValue(inst, out net);
+                        List<CbiOrder> here = working.Where(o => o.Instrument.FullName.Equals(inst, StringComparison.OrdinalIgnoreCase)).ToList();
+
+                        if (cfgProtectiveCheckSec > 0 && net != 0)
+                        {
+                            int covered = ProtectiveQuantity(here, net > 0);
+                            if (covered < Math.Abs(net))
+                                active.Add(new Condition { Key = "P|" + a.Name + "|" + inst, Kind = "P", Seconds = cfgProtectiveCheckSec, Instrument = inst, Net = net, Covered = covered });
+                        }
+
+                        if (cfgOrphanOrderSec > 0 && net == 0 && tokens.Length > 0)
+                        {
+                            List<CbiOrder> exits = here.Where(o => LooksLikeExitOrder(o, tokens)).ToList();
+                            if (exits.Count > 0)
+                            {
+                                string names = string.Join(", ", exits.Select(o => string.IsNullOrEmpty(o.Name) ? o.OrderType.ToString() : o.Name).Distinct().ToArray());
+                                active.Add(new Condition { Key = "O|" + a.Name + "|" + inst, Kind = "O", Seconds = cfgOrphanOrderSec, Instrument = inst, Count = exits.Count, Names = names });
+                            }
+                        }
+                    }
+
+                    if (cfgMaxPositionContracts > 0)
+                    {
+                        int total = nets.Values.Sum(v => Math.Abs(v));
+                        if (total > cfgMaxPositionContracts)
+                            active.Add(new Condition { Key = "L|" + a.Name, Kind = "L", Seconds = 0, Net = total });
+                    }
+
+                    List<Condition> firing = new List<Condition>();
+                    lock (episodeLock)
+                    {
+                        HashSet<string> activeKeys = new HashSet<string>(active.Select(c => c.Key));
+                        foreach (Condition cond in active)
+                        {
+                            DateTime start;
+                            if (!episodeStart.TryGetValue(cond.Key, out start))
+                            {
+                                start = now;
+                                episodeStart[cond.Key] = start;
+                            }
+                            cond.Elapsed = now - start;
+                            if (cond.Elapsed.TotalSeconds >= cond.Seconds && episodeAlerted.Add(cond.Key))
+                                firing.Add(cond);
+                        }
+
+                        List<string> ended = episodeStart.Keys.Where(k => EpisodeBelongsTo(k, a.Name) && !activeKeys.Contains(k)).ToList();
+                        foreach (string key in ended)
+                        {
+                            episodeStart.Remove(key);
+                            episodeAlerted.Remove(key);
+                        }
+                    }
+
+                    foreach (Condition cond in firing)
+                    {
+                        if (cond.Kind == "P")
+                            messages.Add(MsgUnprotected(a.Name, cond.Instrument, cond.Net, cond.Covered, cond.Elapsed));
+                        else if (cond.Kind == "O")
+                            messages.Add(MsgOrphan(a.Name, cond.Instrument, cond.Count, cond.Names, cond.Elapsed));
+                        else
+                            messages.Add(MsgPositionLimit(a.Name, cond.Net, cfgMaxPositionContracts));
+                    }
+                }
+
+                foreach (string text in messages)
+                    EnqueueText(text);
+            }
+            catch (Exception ex)
+            {
+                WriteError("CheckExposure", ex);
+            }
+        }
+
+        private static bool EpisodeBelongsTo(string key, string account)
+        {
+            string[] parts = key.Split('|');
+            return parts.Length >= 2 && parts[1].Equals(account, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Quantity covered by working stop orders on the closing side (a profit-target limit does not protect).
+        private static int ProtectiveQuantity(List<CbiOrder> orders, bool positionIsLong)
+        {
+            int qty = 0;
+            foreach (CbiOrder o in orders)
+            {
+                if (!o.OrderType.ToString().StartsWith("Stop", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                bool closes = positionIsLong
+                    ? o.OrderAction == OrderAction.Sell
+                    : (o.OrderAction == OrderAction.BuyToCover || o.OrderAction == OrderAction.Buy);
+                if (closes)
+                    qty += Convert.ToInt32(o.Quantity);
+            }
+            return qty;
+        }
+
+        private static bool LooksLikeExitOrder(CbiOrder o, string[] tokens)
+        {
+            string name = o.Name ?? string.Empty;
+            foreach (string token in tokens)
+            {
+                if (name.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+            return false;
+        }
+
+        // ---- Orders stuck in a transitional state ----
+
+        private static bool IsStuckState(string state)
+        {
+            return state == "Submitted" || state == "ChangePending" || state == "ChangeSubmitted"
+                || state == "CancelPending" || state == "CancelSubmitted";
+        }
+
+        private void CheckStuckOrder(CbiAccount a, CbiOrder o, string id)
+        {
+            DateTime now = DateTime.UtcNow;
+            string state = o.OrderState.ToString();
+            StateStamp stamp;
+            bool alert = false;
+
+            lock (orderLock)
+            {
+                if (!orderStateSince.TryGetValue(id, out stamp) || stamp.State != state)
+                {
+                    stamp = new StateStamp { State = state, Since = now };
+                    orderStateSince[id] = stamp;
+                    stuckAlerted.Remove(id);
+                }
+                if (IsStuckState(state) && (now - stamp.Since).TotalSeconds >= cfgStuckOrderSec)
+                    alert = stuckAlerted.Add(id);
+            }
+
+            if (alert)
+                EnqueueText(MsgStuck(a.Name, o.Instrument != null ? o.Instrument.FullName : "?", o.OrderAction.ToString(), o.OrderType.ToString(),
+                    Convert.ToString(o.Quantity, CultureInfo.InvariantCulture), state, now - stamp.Since));
+        }
+
+        // ---- Drawdown-floor buffer ----
+
+        private static double ParseOptionalDouble(string text)
+        {
+            double v;
+            if (!string.IsNullOrWhiteSpace(text) && double.TryParse(text.Trim().TrimStart('$').Replace(",", string.Empty), NumberStyles.Float, CultureInfo.InvariantCulture, out v))
+                return v;
+            return double.NaN;
+        }
+
+        // "1500,750,300" -> ascending list of positive amounts.
+        private static List<double> ParseDollarList(string text)
+        {
+            List<double> levels = new List<double>();
+            if (string.IsNullOrWhiteSpace(text))
+                return levels;
+            foreach (string part in text.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                double v = ParseOptionalDouble(part);
+                if (!double.IsNaN(v) && v > 0)
+                    levels.Add(v);
+            }
+            levels.Sort();
+            return levels;
+        }
+
+        private static string N2(double value)
+        {
+            return value.ToString("N2", CultureInfo.InvariantCulture);
+        }
+
+        private static string N0(double value)
+        {
+            return value.ToString("N0", CultureInfo.InvariantCulture);
+        }
+
+        private double FloorFor(string account)
+        {
+            lock (riskLock)
+            {
+                double v;
+                if (floorOverrides.TryGetValue(account, out v))
+                    return v;
+                if (floorOverrides.TryGetValue("*", out v))
+                    return v;
+                if (riskFloors.TryGetValue(account, out v))
+                    return v;
+            }
+            return cfgRiskFloor;
+        }
+
+        // Read by name so a NinjaTrader version without this account item cannot break the compile.
+        private static double NetLiquidationOf(CbiAccount a)
+        {
+            try
+            {
+                object item = Enum.Parse(typeof(AccountItem), "NetLiquidation");
+                return a.Get((AccountItem)item, Currency.UsDollar);
+            }
+            catch (Exception)
+            {
+                return double.NaN;
+            }
+        }
+
+        private void CheckRisk()
+        {
+            try
+            {
+                List<string> loud = new List<string>();
+                List<string> quiet = new List<string>();
+
+                foreach (CbiAccount a in SnapshotTrackedAccounts())
+                {
+                    double floor = FloorFor(a.Name);
+                    if (double.IsNaN(floor))
+                        continue;
+
+                    double netLiq = NetLiquidationOf(a);
+                    if (double.IsNaN(netLiq) || double.IsInfinity(netLiq))
+                    {
+                        if (!riskReadProblemReported)
+                        {
+                            riskReadProblemReported = true;
+                            WriteOutput("Risk buffer: Net Liquidation could not be read for " + a.Name + ".");
+                        }
+                        continue;
+                    }
+
+                    double buffer = netLiq - floor;
+                    double level = double.PositiveInfinity;
+                    if (buffer <= 0)
+                    {
+                        level = 0.0;                                    // at or below the floor itself: always the tightest level
+                    }
+                    else
+                    {
+                        foreach (double candidate in riskBuffers)       // ascending: the first match is the tightest level reached
+                        {
+                            if (buffer <= candidate)
+                            {
+                                level = candidate;
+                                break;
+                            }
+                        }
+                    }
+
+                    double previous;
+                    lock (riskLock)
+                    {
+                        if (!riskLevel.TryGetValue(a.Name, out previous))
+                            previous = double.PositiveInfinity;
+                        riskLevel[a.Name] = level;
+                    }
+                    if (level < previous)
+                        loud.Add(MsgRiskBuffer(a.Name, netLiq, floor, buffer, level));
+                    else if (double.IsPositiveInfinity(level) && !double.IsPositiveInfinity(previous))
+                        quiet.Add(MsgRiskRecovered(a.Name, buffer));
+
+                    if (cfgRiskAutoFlatten && buffer <= cfgRiskFlattenBuffer)
+                    {
+                        bool fire = false;
+                        lock (riskLock)
+                        {
+                            int strikes;
+                            riskStrikes.TryGetValue(a.Name, out strikes);
+                            strikes++;
+                            riskStrikes[a.Name] = strikes;
+
+                            DateTime last;
+                            if (strikes >= 2 && (!lastAutoFlatten.TryGetValue(a.Name, out last) || (DateTime.UtcNow - last).TotalMinutes >= 10))
+                            {
+                                lastAutoFlatten[a.Name] = DateTime.UtcNow;
+                                fire = true;
+                            }
+                        }
+                        if (fire)
+                            loud.Add(AutoFlattenAccount(a, netLiq, floor, buffer));
+                    }
+                    else
+                    {
+                        lock (riskLock)
+                            riskStrikes[a.Name] = 0;
+                    }
+                }
+
+                foreach (string text in loud)
+                    EnqueueText(text);
+                foreach (string text in quiet)
+                    EnqueueQuiet(text);
+            }
+            catch (Exception ex)
+            {
+                WriteError("CheckRisk", ex);
+            }
+        }
+
+        // Two readings in a row inside the flatten buffer, at most once per 10 minutes per account.
+        private string AutoFlattenAccount(CbiAccount a, double netLiq, double floor, double buffer)
+        {
+            lastFlattenUtc = DateTime.UtcNow;
+            reentryAlerted = false;
+
+            string flattened;
+            try
+            {
+                List<CbiInstrument> instruments = CollectExposedInstruments(a);
+                if (instruments.Count == 0)
+                {
+                    flattened = "already flat";
+                }
+                else
+                {
+                    a.Flatten(instruments);
+                    flattened = string.Join(", ", instruments.Select(i => i.FullName).ToArray());
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteError("Auto-flatten", ex);
+                flattened = "failed: " + ex.Message;
+            }
+            return MsgAutoFlatten(a.Name, netLiq, floor, buffer, flattened);
+        }
+
+        private static string FloorsPath()
+        {
+            return System.IO.Path.Combine(System.IO.Path.GetDirectoryName(ConfigPath()), "DirectTelegramNotifier.floors");
+        }
+
+        private void LoadFloorOverrides()
+        {
+            try
+            {
+                string path = FloorsPath();
+                if (!File.Exists(path))
+                    return;
+                lock (riskLock)
+                {
+                    floorOverrides.Clear();
+                    foreach (string line in File.ReadAllLines(path))
+                    {
+                        int eq = line.LastIndexOf('=');
+                        if (eq <= 0)
+                            continue;
+                        double v = ParseOptionalDouble(line.Substring(eq + 1));
+                        string account = line.Substring(0, eq).Trim();
+                        if (!double.IsNaN(v) && account.Length > 0)
+                            floorOverrides[account] = v;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteError("Loading floors", ex);
+            }
+        }
+
+        private bool SaveFloorOverrides()
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder();
+                lock (riskLock)
+                {
+                    foreach (KeyValuePair<string, double> kv in floorOverrides)
+                        sb.Append(kv.Key).Append('=').Append(kv.Value.ToString("R", CultureInfo.InvariantCulture)).Append("\r\n");
+                }
+                string path = FloorsPath();
+                if (sb.Length == 0)
+                {
+                    if (File.Exists(path))
+                        File.Delete(path);
+                }
+                else
+                {
+                    File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                WriteError("Saving floors", ex);
+                return false;
+            }
+        }
+
+        // /floor            show floors and buffers
+        // /floor 48250      floor for every tracked account
+        // /floor 002 48500  floor for one account (part of its name)
+        // /floor 002 clear  remove that account's /floor setting;  /floor clear  removes all /floor settings
+        private string HandleFloorCommand(string argument)
+        {
+            string arg = (argument ?? string.Empty).Trim();
+            string[] parts = arg.Length == 0 ? new string[0] : arg.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            string note = string.Empty;
+
+            if (parts.Length == 1 && parts[0].Equals("clear", StringComparison.OrdinalIgnoreCase))
+            {
+                lock (riskLock)
+                    floorOverrides.Clear();
+                note = SaveFloorOverrides() ? "All /floor settings removed (config-file floors apply again).\n\n" : EmWarn + " Removed, but the change could not be saved to disk.\n\n";
+            }
+            else if (parts.Length == 1)
+            {
+                double v = ParseOptionalDouble(parts[0]);
+                if (double.IsNaN(v))
+                    return EmInfo + " Usage: /floor 48250  \u00B7  /floor 002 48500  \u00B7  /floor 002 clear  \u00B7  /floor clear";
+                lock (riskLock)
+                {
+                    floorOverrides["*"] = v;
+                }
+                note = (SaveFloorOverrides() ? EmOk : EmWarn + " (not saved to disk)") + " Floor " + N2(v) + " set for every tracked account.\n\n";
+            }
+            else if (parts.Length == 2)
+            {
+                string problem;
+                List<CbiAccount> targets = ResolveAccounts(parts[0], out problem);
+                if (targets == null)
+                    return EmInfo + " " + Html(problem);
+                if (parts[1].Equals("clear", StringComparison.OrdinalIgnoreCase))
+                {
+                    lock (riskLock)
+                        floorOverrides.Remove(targets[0].Name);
+                    note = (SaveFloorOverrides() ? EmOk : EmWarn + " (not saved to disk)") + " " + Html(targets[0].Name) + ": /floor setting removed.\n\n";
+                }
+                else
+                {
+                    double v = ParseOptionalDouble(parts[1]);
+                    if (double.IsNaN(v))
+                        return EmInfo + " Usage: /floor 002 48500";
+                    lock (riskLock)
+                        floorOverrides[targets[0].Name] = v;
+                    note = (SaveFloorOverrides() ? EmOk : EmWarn + " (not saved to disk)") + " " + Html(targets[0].Name) + ": floor " + N2(v) + ".\n\n";
+                }
+            }
+            else if (parts.Length > 2)
+            {
+                return EmInfo + " Usage: /floor 48250  \u00B7  /floor 002 48500  \u00B7  /floor clear";
+            }
+
+            return note + BuildFloorReport();
+        }
+
+        private string BuildFloorReport()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append(EmChart).Append(" <b>RISK FLOORS</b>\n");
+            bool any = false;
+            foreach (CbiAccount a in SnapshotTrackedAccounts())
+            {
+                double floor = FloorFor(a.Name);
+                if (double.IsNaN(floor))
+                {
+                    sb.Append(Html(a.Name)).Append(": no floor set\n");
+                    continue;
+                }
+                any = true;
+                double netLiq = NetLiquidationOf(a);
+                sb.Append("<b>").Append(Html(a.Name)).Append("</b>").Append(Sep).Append("floor ").Append(N2(floor));
+                if (!double.IsNaN(netLiq))
+                    sb.Append(Sep).Append("net liq ").Append(N2(netLiq)).Append(Sep).Append(N2(netLiq - floor)).Append(" buffer");
+                sb.Append("\n");
+            }
+            sb.Append("<i>Alerts at ").Append(riskBuffers.Count > 0 ? string.Join(", ", riskBuffers.Select(l => N2(l)).ToArray()) : "no levels")
+              .Append(" above the floor").Append(cfgRiskAutoFlatten ? "; auto-flatten within " + N2(cfgRiskFlattenBuffer) : string.Empty).Append(".</i>\n");
+            if (!any)
+                sb.Append("<i>Set one with /floor 48250, or RiskFloor= in the config file.</i>");
+            return sb.ToString().TrimEnd('\n');
+        }
+
+        // ---- NinjaTrader process health ----
+
+        private void CheckMachineHealth()
+        {
+            try
+            {
+                DateTime now = DateTime.UtcNow;
+                using (System.Diagnostics.Process p = System.Diagnostics.Process.GetCurrentProcess())
+                {
+                    double cpuSeconds = p.TotalProcessorTime.TotalSeconds;
+                    if (lastCpuSampleUtc != DateTime.MinValue)
+                    {
+                        double wall = (now - lastCpuSampleUtc).TotalSeconds;
+                        if (wall >= 1.0)
+                            lastCpuPercent = Math.Max(0.0, (cpuSeconds - lastCpuSeconds) / wall / Math.Max(1, Environment.ProcessorCount) * 100.0);
+                    }
+                    lastCpuSampleUtc = now;
+                    lastCpuSeconds = cpuSeconds;
+                    lastMemoryMb = (int)(p.WorkingSet64 / (1024 * 1024));
+                }
+
+                EvaluateCpu(lastCpuPercent, now);
+                EvaluateMemory(lastMemoryMb, now);
+
+                if ((now - lastDiskCheckUtc).TotalMinutes >= 5)
+                {
+                    lastDiskCheckUtc = now;
+                    lastDiskFreeMb = DiskFreeMb(out lastDiskDrive);
+                    EvaluateDisk(lastDiskDrive, lastDiskFreeMb, now);
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteThrottled("Machine health check failed: " + Describe(ex));
+            }
+        }
+
+        private string lastDiskDrive = string.Empty;
+
+        private void EvaluateCpu(double percent, DateTime now)
+        {
+            if (cfgCpuAlertPercent <= 0)
+                return;
+            if (percent < cfgCpuAlertPercent)
+            {
+                cpuHighSince = DateTime.MinValue;
+                return;
+            }
+            if (cpuHighSince == DateTime.MinValue)
+                cpuHighSince = now;
+            if ((now - cpuHighSince).TotalSeconds >= cfgCpuAlertSeconds && (now - lastCpuAlertUtc).TotalMinutes >= 30)
+            {
+                lastCpuAlertUtc = now;
+                EnqueueText(MsgCpuHigh(percent, now - cpuHighSince));
+            }
+        }
+
+        private void EvaluateMemory(int memoryMb, DateTime now)
+        {
+            if (cfgMemoryAlertMb > 0 && memoryMb >= cfgMemoryAlertMb && (now - lastMemAlertUtc).TotalHours >= 6)
+            {
+                lastMemAlertUtc = now;
+                EnqueueText(MsgMemoryHigh(memoryMb, cfgMemoryAlertMb));
+            }
+        }
+
+        private void EvaluateDisk(string drive, long freeMb, DateTime now)
+        {
+            if (cfgDiskAlertMb > 0 && freeMb >= 0 && freeMb < cfgDiskAlertMb && (now - lastDiskAlertUtc).TotalHours >= 6)
+            {
+                lastDiskAlertUtc = now;
+                EnqueueText(MsgDiskLow(drive, freeMb));
+            }
+        }
+
+        private static long DiskFreeMb(out string drive)
+        {
+            drive = string.Empty;
+            try
+            {
+                string root = System.IO.Path.GetPathRoot(System.IO.Path.GetDirectoryName(ConfigPath()));
+                if (string.IsNullOrEmpty(root))
+                    return -1;
+                drive = root.TrimEnd('\\');
+                return new DriveInfo(root).AvailableFreeSpace / (1024 * 1024);
+            }
+            catch (Exception)
+            {
+                return -1;
+            }
+        }
+
+        #endregion
+
+        #region Message templates for the safety checks
+
+        private static string MsgUnprotected(string account, string instrument, int net, int covered, TimeSpan elapsed)
+        {
+            return EmSiren + " <b>UNPROTECTED POSITION</b>\n"
+                + Html(account) + Sep + FormatNet(net) + " <code>" + Html(instrument) + "</code>\n"
+                + (covered <= 0
+                    ? "No working stop order for " + FormatDuration(elapsed) + "."
+                    : "Working stops cover only " + Num(covered) + " of " + Num(Math.Abs(net)) + " contracts for " + FormatDuration(elapsed) + ".") + "\n"
+                + "<i>If your strategy handles stops internally, set ProtectiveCheckSeconds=0. Otherwise add a stop or /flatten.</i>";
+        }
+
+        private static string MsgOrphan(string account, string instrument, int count, string names, TimeSpan elapsed)
+        {
+            return EmSiren + " <b>ORPHAN EXIT ORDERS</b>\n"
+                + Html(account) + Sep + "<code>" + Html(instrument) + "</code> is flat\n"
+                + Num(count) + (count == 1 ? " exit-type order is" : " exit-type orders are") + " still working (" + Html(names) + ") after " + FormatDuration(elapsed) + ".\n"
+                + "<i>A leftover stop or target can open an unwanted position. /cancel removes working orders.</i>";
+        }
+
+        private static string MsgStuck(string account, string instrument, string action, string type, string qty, string state, TimeSpan elapsed)
+        {
+            return EmWarn + " <b>ORDER STUCK</b>\n"
+                + Html(action) + " " + Html(type) + " " + Html(qty) + " \u00D7 " + Html(instrument) + Sep + Html(account) + "\n"
+                + "State " + Html(state) + " for " + FormatDuration(elapsed) + ". It may not be reaching the broker.\n"
+                + "<i>Check the connection and the Orders tab.</i>";
+        }
+
+        private static string MsgPositionLimit(string account, int total, int limit)
+        {
+            return EmSiren + " <b>POSITION LIMIT EXCEEDED</b>\n"
+                + Html(account) + Sep + Num(total) + " contracts open (limit " + Num(limit) + ")\n"
+                + "<i>Check the strategies and the copier. /flatten closes positions.</i>";
+        }
+
+        private static string MsgRiskBuffer(string account, double netLiq, double floor, double buffer, double level)
+        {
+            return EmSiren + " <b>RISK BUFFER</b>\n"
+                + Html(account) + "\n"
+                + "Net liq " + N2(netLiq) + Sep + "floor " + N2(floor) + "\n"
+                + (buffer > 0 ? "<b>" + N2(buffer) + " above</b> the floor" : "<b>" + N2(-buffer) + " BELOW</b> the floor")
+                + (level > 0 ? " (alert level " + N2(level) + ")" : string.Empty) + "\n"
+                + "<i>Trailing floors move: keep yours current with /floor.</i>";
+        }
+
+        private static string MsgRiskRecovered(string account, double buffer)
+        {
+            return EmOk + " <b>RISK BUFFER RECOVERED</b>\n" + Html(account) + Sep + N2(buffer) + " above the floor";
+        }
+
+        private static string MsgAutoFlatten(string account, double netLiq, double floor, double buffer, string flattened)
+        {
+            return EmStop + " <b>AUTO-FLATTEN</b>\n"
+                + Html(account) + "\n"
+                + "Net liq " + N2(netLiq) + " is only " + N2(buffer) + " above the floor " + N2(floor) + ".\n"
+                + "Flatten sent: " + Html(flattened) + "\n"
+                + "<i>Enabled strategies are not disabled and can re-enter.</i>";
+        }
+
+        private static string MsgCpuHigh(double percent, TimeSpan duration)
+        {
+            return EmWarn + " <b>NINJATRADER CPU HIGH</b>\n"
+                + Num((int)Math.Round(percent)) + "% for " + FormatDuration(duration) + ". Orders and copying may lag.\n"
+                + "<i>Close unused charts, Market Analyzer windows and indicators.</i>";
+        }
+
+        private static string MsgMemoryHigh(int memoryMb, int limitMb)
+        {
+            return EmWarn + " <b>NINJATRADER MEMORY HIGH</b>\n"
+                + "Using " + N0(memoryMb) + " MB (alert at " + N0(limitMb) + " MB).\n"
+                + "<i>A restart while flat clears it.</i>";
+        }
+
+        private static string MsgDiskLow(string drive, long freeMb)
+        {
+            return EmWarn + " <b>DISK SPACE LOW</b>\n"
+                + Html(drive) + " has " + N0(freeMb) + " MB free.\n"
+                + "<i>NinjaTrader logs and data may stop being written.</i>";
         }
 
         #endregion

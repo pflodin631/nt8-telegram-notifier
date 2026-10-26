@@ -15,3 +15,9 @@ dist/
 *.user
 Thumbs.db
 .DS_Store
+
+# Runtime files the add-on writes next to your config (never commit)
+DirectTelegramNotifier-fills.csv
+DirectTelegramNotifier-fills.csv.old
+DirectTelegramNotifier.floors
+*.csv

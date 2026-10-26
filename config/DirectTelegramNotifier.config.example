@@ -6,13 +6,11 @@
 # --- Telegram ---
 # BotToken: from @BotFather. Leave blank to use the NT_TELEGRAM_BOT_TOKEN environment variable instead.
 BotToken=
-# AuthorizedChatID: your numeric Telegram user ID (ask @userinfobot). Alerts go here; only this user can send commands.
+# AuthorizedChatID: your numeric Telegram user ID. Alerts go here; only this user can send commands.
 AuthorizedChatID=
 
 # --- Accounts ---
 # AccountName: one account, a comma-separated list, or * for all connected accounts.
-# The FIRST account in the list is the copier leader (unless LeaderAccount is set below); the rest follow.
-# Example: AccountName=LeaderAccount,FollowerAccount2,FollowerAccount3
 AccountName=Sim101
 
 # --- Features ---
@@ -34,7 +32,7 @@ EodTimeZoneId=Eastern Standard Time
 EstimatedCommissionPerSide=0
 
 # --- Heartbeat and restart detection ---
-# HeartbeatUrl: optional dead-man's-switch ping URL (e.g. from Healthchecks.io). Blank = off. Treat it like a secret.
+# HeartbeatUrl: optional dead-man's-switch ping URL (e.g. from Healthchecks.io). Blank = off.
 HeartbeatUrl=
 HeartbeatIntervalSec=60
 # RestartGapThresholdSec: on startup, report downtime longer than this many seconds.
@@ -58,3 +56,42 @@ LeaderAccount=
 FollowerRatio=1
 # MismatchSeconds: alert when followers stay out of sync with the leader this long. 0 = off.
 MismatchSeconds=20
+
+# --- Safety checks ---
+# ProtectiveCheckSeconds: alert when an open position has no working stop order for this long. 0 = off.
+# Turn it on only if your strategies place real stop orders (not internal stop logic).
+ProtectiveCheckSeconds=0
+# OrphanOrderSeconds: alert when an account is flat but exit-type orders (name contains one of OrphanOrderNames) keep working this long. 0 = off.
+OrphanOrderSeconds=20
+OrphanOrderNames=Stop,Target
+# StuckOrderSeconds: alert when an order sits in Submitted / change pending / cancel pending this long. 0 = off.
+StuckOrderSeconds=30
+# MaxPositionContracts: alert when an account holds more than this many contracts in total. 0 = off.
+MaxPositionContracts=0
+
+# --- Risk buffer (prop-firm drawdown floor) ---
+# RiskFloor: the Net Liquidation value at which an account fails, from your firm's rules. Blank = off.
+# Most trailing floors move: update them with the /floor command. A per-account floor overrides it, e.g.  RiskFloor:MyAccount001=48500
+RiskFloor=
+# RiskBufferAlerts: alert as Net Liquidation comes within these many dollars of the floor.
+RiskBufferAlerts=1500,750,300
+# RiskAutoFlatten: true = flatten an account that gets within RiskFlattenBuffer dollars of its floor. Test on Sim first.
+RiskAutoFlatten=false
+RiskFlattenBuffer=150
+
+# --- Machine health (the NinjaTrader process) ---
+# CpuAlertPercent / CpuAlertSeconds: alert when NinjaTrader's CPU stays at or above this level this long. 0 = off.
+CpuAlertPercent=90
+CpuAlertSeconds=180
+# MemoryAlertMB: alert when NinjaTrader uses more memory than this. 0 = off.
+MemoryAlertMB=0
+# DiskAlertMB: alert when the drive holding the config folder has less free space than this. 0 = off.
+DiskAlertMB=2000
+
+# --- Convenience ---
+# FlattenConfirm: true = /flatten first shows Confirm / Cancel buttons (expire after 30 s). false = flatten immediately.
+FlattenConfirm=false
+# SilentRoutineAlerts: true = fills, reconnects, in-sync notices, reports and command replies arrive without a notification sound; problems still ring.
+SilentRoutineAlerts=false
+# EnableFillCsv: write every fill (and leader vs follower comparison) to DirectTelegramNotifier-fills.csv in this folder.
+EnableFillCsv=true

@@ -1,0 +1,17 @@
+# Real configuration and runtime files: these contain your bot token, user ID
+# or heartbeat URL, or are generated at runtime. NEVER commit them.
+DirectTelegramNotifier.config
+DirectTelegramNotifier.log
+DirectTelegramNotifier.log.old
+DirectTelegramNotifier.heartbeat
+*.config
+!*.config.example
+*.log
+.env
+
+# Local build/export output and editor files
+dist/
+.vs/
+*.user
+Thumbs.db
+.DS_Store

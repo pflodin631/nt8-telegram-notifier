@@ -1,0 +1,60 @@
+# DirectTelegramNotifier configuration (example)
+# Copy this file to:  Documents\NinjaTrader 8\DirectTelegramNotifier.config
+# and fill in the values. Do not commit your real config anywhere.
+# After editing: press F5 in the NinjaScript Editor, or restart NinjaTrader.
+
+# --- Telegram ---
+# BotToken: from @BotFather. Leave blank to use the NT_TELEGRAM_BOT_TOKEN environment variable instead.
+BotToken=
+# AuthorizedChatID: your numeric Telegram user ID (ask @userinfobot). Alerts go here; only this user can send commands.
+AuthorizedChatID=
+
+# --- Accounts ---
+# AccountName: one account, a comma-separated list, or * for all connected accounts.
+# The FIRST account in the list is the copier leader (unless LeaderAccount is set below); the rest follow.
+# Example: AccountName=LeaderAccount,FollowerAccount2,FollowerAccount3
+AccountName=Sim101
+
+# --- Features ---
+EnableWatchdog=true
+EnableExecutions=true
+EnableRemoteCommands=true
+EnableOrderRejectAlerts=true
+# RunawayMaxOrders: alert when this many new orders appear within RunawayWindowSec. 0 = off.
+RunawayMaxOrders=30
+RunawayWindowSec=60
+# true = /flatten calls FlattenEverything() and hits EVERY connected account.
+UseGlobalFlattenEverything=false
+
+# --- End of day ---
+# EodReportTime: HHMMSS in EodTimeZoneId (a Windows time zone id; DST is handled automatically).
+EodReportTime=170000
+EodTimeZoneId=Eastern Standard Time
+# Used only when NinjaTrader reports zero commission for a fill (e.g. Sim without a commission template).
+EstimatedCommissionPerSide=0
+
+# --- Heartbeat and restart detection ---
+# HeartbeatUrl: optional dead-man's-switch ping URL (e.g. from Healthchecks.io). Blank = off. Treat it like a secret.
+HeartbeatUrl=
+HeartbeatIntervalSec=60
+# RestartGapThresholdSec: on startup, report downtime longer than this many seconds.
+RestartGapThresholdSec=45
+
+# --- Monitoring ---
+EnableStrategyWatch=true
+# StaleDataSeconds: alert when an instrument you trade gets no ticks this long while the data connection says Connected. 0 = off.
+StaleDataSeconds=120
+# StaleDataSchedule: cme = ignore the daily 17:00-18:00 ET break and the weekend; always = never ignore.
+StaleDataSchedule=cme
+# StaleDataInstruments: extra instruments to always watch, comma-separated (e.g. MNQ 12-26). Instruments you trade or hold are watched automatically.
+StaleDataInstruments=
+# EnableAlertLog: also append every alert to DirectTelegramNotifier.log in this folder.
+EnableAlertLog=true
+
+# --- Trade copier check (e.g. Replikanto) ---
+# LeaderAccount: the account that leads. Blank = the first account in AccountName. Every other tracked account is a follower.
+LeaderAccount=
+# FollowerRatio: expected follower position as a multiple of the leader's (1 = same size).
+FollowerRatio=1
+# MismatchSeconds: alert when followers stay out of sync with the leader this long. 0 = off.
+MismatchSeconds=20

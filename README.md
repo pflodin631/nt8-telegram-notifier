@@ -2,7 +2,7 @@
 
 Telegram alerts and a small remote-control surface for **NinjaTrader 8**, as a single-file AddOn. It talks straight to the Telegram Bot API over HTTPS: no NinjaTrader Share Services, no third-party servers, no extra DLLs.
 
-> **Status: beta (v0.1.0).** It can flatten positions on command, so read [Limitations](#limitations) and the [Disclaimer](#disclaimer) before running it anywhere near live money. Not affiliated with or endorsed by NinjaTrader or Telegram.
+> **Status: beta (v0.1.2).** It can flatten positions on command, so read [Limitations](#limitations) and the [Disclaimer](#disclaimer) before running it anywhere near live money. Not affiliated with or endorsed by NinjaTrader or Telegram.
 
 ## What it does
 
@@ -23,6 +23,11 @@ Telegram alerts and a small remote-control surface for **NinjaTrader 8**, as a s
 |---|---|
 | `/status` | Connections, positions and P&L per account, copier status, strategies, data feeds |
 | `/flatten` | Closes positions and cancels working orders on the tracked accounts, then reports whether you are flat |
+| `/copy` | Follower fills compared with the leader today: price difference, dollars, lag |
+| `/eod` | Preview the end-of-day report without resetting anything |
+| `/diag` | Health: last Telegram send and poll, queue, clock offset, memory, settings, recent log |
+| `/simulate` | One sample of every alert type, built by the same code as the real ones |
+| `/version` | Add-on version |
 | `/help` | Lists the commands |
 
 **Also:** every alert is appended to a local log file, and an optional external heartbeat (dead-man's switch) can tell you when NinjaTrader stops responding altogether.
@@ -30,10 +35,13 @@ Telegram alerts and a small remote-control surface for **NinjaTrader 8**, as a s
 Example messages:
 
 ```
-🟢 BUY MNQ DEC26 · 10:42:07
-MFFUEVREOD…001 (leader) · 3 @ 29411.00
-MFFUEVREOD…002 · 3 @ 29410.00 · 4 ticks better
-MFFUEVREOD…003 · 3 @ 29410.00 · 4 ticks better
+BUY MNQ DEC26 · 10:42:07
+Account1 (leader) · 3 @ 29411.00
+Account2 · 3 @ 29410.00 · 4 ticks better
+Account3 · 3 @ 29410.00 · 4 ticks better
+
+Copy quality (followers vs leader)
+Account2: avg 6 ticks better per fill · +18.00 vs leader · lag 175 ms avg, 200 max · 2 fills
 
 CONNECTION LOST
 MyConnection · orders + data
@@ -91,6 +99,9 @@ The config is read at startup only. After editing it, press F5 in the NinjaScrip
 | `LeaderAccount` | blank | Copier leader. Blank = first account in `AccountName` |
 | `FollowerRatio` | `1` | Expected follower size as a multiple of the leader's |
 | `MismatchSeconds` | `20` | Alert when followers stay out of sync this long. `0` = off |
+| `FlattenConfirm` | `false` | true makes /flatten show Confirm / Cancel buttons first (they expire after 30 s) |
+| `SilentRoutineAlerts` | `false` | true sends fills, reconnects, reports and command replies without a notification sound |
+| `EnableFillCsv` | `true` | Append every fill and leader-vs-follower comparison to DirectTelegramNotifier-fills.csv |
 
 ## Heartbeat (optional, recommended)
 
@@ -120,6 +131,8 @@ Pings are skipped while NinjaTrader's UI is frozen, so a hung NinjaTrader also t
 - **End-of-day P&L** comes from the fills this add-on has seen since its last report. Positions carried in from before it started are not included, so compare with the broker's number, which is printed too.
 - One notifier per NinjaTrader process, one bot and chat.
 - Commands and alerts depend on Telegram and your internet connection being up.
+- Copy-quality figures and the fills CSV need a leader (first account in AccountName, or LeaderAccount) and fills within about 2 seconds of each other to be paired.
+- NinjaTrader's execution records often show zero commission, so reports say "fees not in fills". Set EstimatedCommissionPerSide to include an estimate; the broker-reported figure is printed as well.
 
 ## Verified so far
 
@@ -133,9 +146,15 @@ Pings are skipped while NinjaTrader's UI is frozen, so a hung NinjaTrader also t
 | Restart report | ✅ |
 | Rejected-order and order-rate alerts | ✅ |
 | Strategy enabled / disabled alerts | ✅ |
-| Stale-data alerts | ⬜ |
-| Copier mismatch alerts | ⬜ |
-| End-of-day summary | ⬜ |
+| Stale-data alerts | ✅ |
+| Copier mismatch alerts | ✅ |
+| End-of-day summary | ✅ |
+| Grouped fill alerts with leader comparison | ⬜ |
+| Long polling: commands answered immediately | ✅ |
+| /simulate, /diag, /copy, /eod | ✅ |
+| FlattenConfirm buttons | ⬜ |
+| Re-entry-after-flatten alert | ⬜ |
+| Fill CSV export | ⬜ |
 
 Tested with NinjaTrader **8.1.8.4**, **Tradovate / MFFU**, **Sim**.
 

@@ -32,7 +32,7 @@ using CbiPosition = NinjaTrader.Cbi.Position;
 //             order-rate spikes, strategy disabled, stale market data, trade-copier mismatch
 //             (leader vs followers), restart/crash detection, end-of-day summary.
 //             Every alert is also appended to Documents\NinjaTrader 8\DirectTelegramNotifier.log.
-//  Commands:  /status  /flatten  /help   (accepted only from AuthorizedChatID)
+//  Commands:  /status  /flatten  /copy  /eod  /diag  /simulate  /version  /help   (only from AuthorizedChatID)
 //  Optional:  external heartbeat ping (dead-man's switch, e.g. Healthchecks.io).
 //
 //  Configuration: Documents\NinjaTrader 8\DirectTelegramNotifier.config (template created on
@@ -45,7 +45,7 @@ using CbiPosition = NinjaTrader.Cbi.Position;
 //     ignored, so a stale /flatten never runs after a restart or reboot.
 //   * /flatten covers the tracked account(s) only, unless UseGlobalFlattenEverything=true.
 //
-//  Version 0.1.1, MIT License. Not affiliated with or endorsed by NinjaTrader or Telegram.
+//  Version 0.1.2, MIT License. Not affiliated with or endorsed by NinjaTrader or Telegram.
 //  Provided as is, without warranty. Automated trading and remote order control carry risk.
 //
 //  Written in C# 5 syntax so it compiles on any NinjaScript compiler version.
@@ -76,7 +76,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const int    RunawayCooldownSec   = 300;
         private const int    StopMessageTimeoutMs = 3500;
         private const int    ConnectionMergeMs    = 1500;
-        private const string AddOnVersion        = "0.1.1";
+        private const int    SendTimeoutMs        = 30000;
+        private const int    PollTimeoutSec       = 25;
+        private const int    PollHttpTimeoutMs    = 45000;
+        private const int    PollIdleMs           = 250;
+        private const int    FlattenConfirmSec    = 30;
+        private const int    ClockDriftAlertSec   = 15;
+        private const int    ReentryWindowSec     = 90;
+        private const string AddOnVersion        = "0.1.2";
         private const string HeartbeatFileName    = "DirectTelegramNotifier.heartbeat";
         private const string Sep                  = " \u00B7 ";
 
@@ -112,6 +119,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             public string Text;
             public DateTime CreatedUtc;
             public int Attempts;
+            public bool Silent;
+            public bool Plain;
+            public string ReplyMarkup;
         }
 
         private sealed class Lot
@@ -144,6 +154,17 @@ namespace NinjaTrader.NinjaScript.AddOns
             public double LargestLoss;
         }
 
+        // Leader-vs-follower price and timing differences, accumulated per follower account.
+        private sealed class CopyStat
+        {
+            public int Count;
+            public double SumTicks;        // positive = follower did worse than the leader
+            public double SumDollars;      // positive = follower did better than the leader
+            public double WorstTicks;
+            public double SumLagMs;
+            public double MaxLagMs;
+        }
+
         // Fills of one instrument and side that arrive close together, one leg per account.
         private sealed class FillLeg
         {
@@ -153,6 +174,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             public int Quantity;
             public double Notional;
             public int FillCount;
+            public DateTime FirstTime;
         }
 
         private sealed class FillGroup
@@ -161,6 +183,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             public string InstrumentName;
             public bool IsBuy;
             public DateTime FirstTime;
+            public string SimLeader;               // used only by /simulate
+            public double SimTick;                 // used only by /simulate
             public readonly Dictionary<string, FillLeg> Legs = new Dictionary<string, FillLeg>(StringComparer.OrdinalIgnoreCase);
         }
 
@@ -248,6 +272,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         private string cfgLeaderAccount = string.Empty;
         private double cfgFollowerRatio = 1.0;
         private int    cfgMismatchSeconds = 20;
+        private bool   cfgFlattenConfirm = false;
+        private bool   cfgSilentRoutine = false;
+        private bool   cfgEnableFillCsv = true;
         private bool   cfgEnableOrderRejectAlerts = true;
         private int    cfgRunawayMaxOrders = 30;
         private int    cfgRunawayWindowSec = 60;
@@ -285,9 +312,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         private readonly List<CbiAccount> trackedAccounts = new List<CbiAccount>();
 
         private readonly object statsLock = new object();
-        private readonly HashSet<string> seenExecutionIds = new HashSet<string>();
+        private readonly Dictionary<string, DateTime> seenExecutionIds = new Dictionary<string, DateTime>();    // pruned by age, guarded by statsLock
         private readonly Dictionary<string, PositionBook> books = new Dictionary<string, PositionBook>();
-        private SessionStats stats = new SessionStats();
+        private readonly Dictionary<string, SessionStats> acctStats = new Dictionary<string, SessionStats>(StringComparer.OrdinalIgnoreCase);    // guarded by statsLock
+        private readonly Dictionary<string, CopyStat> copyStats = new Dictionary<string, CopyStat>(StringComparer.OrdinalIgnoreCase);         // guarded by statsLock
+        private readonly object csvLock = new object();
         private DateTime sessionStartNt;
 
         private TimeZoneInfo eodTimeZone = TimeZoneInfo.Local;
@@ -329,6 +358,23 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private readonly object logLock = new object();
         private string alertLogPath = string.Empty;
+
+        private volatile bool pollFailed;
+        private DateTime lastSendOkUtc = DateTime.MinValue;
+        private int lastSendMs;
+        private DateTime lastPollOkUtc = DateTime.MinValue;
+        private double lastClockDriftSec;
+        private DateTime clockAlertUtc = DateTime.MinValue;
+        private DateTime lastFlattenUtc = DateTime.MinValue;
+        private bool reentryAlerted;
+        private DateTime lastPruneUtc = DateTime.UtcNow;
+
+        private readonly object confirmLock = new object();
+        private string confirmToken = string.Empty;
+        private DateTime confirmExpiresUtc = DateTime.MinValue;
+
+        private readonly object linesLock = new object();
+        private readonly Queue<string> recentLines = new Queue<string>();
 
         private readonly object orderLock = new object();
         private readonly HashSet<string> seenOrderIds = new HashSet<string>();
@@ -432,7 +478,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (cfgEnableWatchdog)
             {
-                EnqueueText(BuildOnlineMessage());
+                EnqueueQuiet(BuildOnlineMessage());
                 if (!string.IsNullOrEmpty(startupGapNote))
                     EnqueueText(startupGapNote);
             }
@@ -553,6 +599,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
                 CheckStaleData();
                 CheckCopyMismatch();
+                PruneTrackingSets();
                 CheckEndOfDay();
             }
             catch (Exception ex)
@@ -637,7 +684,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                  + "# FollowerRatio: expected follower position as a multiple of the leader's (1 = same size).\r\n"
                  + "FollowerRatio=1\r\n"
                  + "# MismatchSeconds: alert when followers stay out of sync with the leader this long. 0 = off.\r\n"
-                 + "MismatchSeconds=20\r\n";
+                 + "MismatchSeconds=20\r\n"
+                 + "\r\n"
+                 + "# --- Convenience ---\r\n"
+                 + "# FlattenConfirm: true = /flatten first shows Confirm / Cancel buttons (expire after 30 s). false = flatten immediately.\r\n"
+                 + "FlattenConfirm=false\r\n"
+                 + "# SilentRoutineAlerts: true = fills, reconnects, in-sync notices, reports and command replies arrive without a notification sound; problems still ring.\r\n"
+                 + "SilentRoutineAlerts=false\r\n"
+                 + "# EnableFillCsv: write every fill (and leader vs follower comparison) to DirectTelegramNotifier-fills.csv in this folder.\r\n"
+                 + "EnableFillCsv=true\r\n";
         }
 
         private bool LoadConfiguration()
@@ -693,6 +748,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             cfgLeaderAccount              = GetString(kv, "LeaderAccount", string.Empty);
             cfgFollowerRatio              = Math.Max(0.0, GetDouble(kv, "FollowerRatio", 1.0));
             cfgMismatchSeconds            = Math.Max(0, GetInt(kv, "MismatchSeconds", 20));
+            cfgFlattenConfirm             = GetBool(kv, "FlattenConfirm", false);
+            cfgSilentRoutine              = GetBool(kv, "SilentRoutineAlerts", false);
+            cfgEnableFillCsv              = GetBool(kv, "EnableFillCsv", true);
             cfgEnableOrderRejectAlerts    = GetBool(kv, "EnableOrderRejectAlerts", true);
             cfgRunawayMaxOrders           = Math.Max(0, GetInt(kv, "RunawayMaxOrders", 30));
             cfgRunawayWindowSec           = Math.Max(10, GetInt(kv, "RunawayWindowSec", 60));
@@ -876,7 +934,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                         connNotices.Remove(key);
                     }
                     if (ready != null)
-                        EnqueueText(BuildConnectionMessage(ready));
+                    {
+                        if (ready.Down)
+                            EnqueueText(BuildConnectionMessage(ready));
+                        else
+                            EnqueueQuiet(BuildConnectionMessage(ready));
+                    }
                 });
             }
         }
@@ -920,7 +983,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (uiFreezeAlerted)
                 {
                     uiFreezeAlerted = false;
-                    EnqueueText(EmOk + " <b>UI RECOVERED</b>\nNinjaTrader's UI was blocked for about " + FormatDuration(TimeSpan.FromTicks(pong - sent)) + ".");
+                    EnqueueQuiet(MsgUiRecovered(TimeSpan.FromTicks(pong - sent)));
                 }
 
                 Interlocked.Exchange(ref uiProbeSentTicks, now);
@@ -939,8 +1002,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (waited > UiFreezeAlertSec && !uiFreezeAlerted)
                 {
                     uiFreezeAlerted = true;
-                    EnqueueText(EmWarn + " <b>NINJATRADER UI FROZEN</b>\n"
-                        + "No response for " + Num((int)waited) + "s. Orders and strategies may be affected. Check the machine.");
+                    EnqueueText(MsgUiFrozen((int)waited));
                 }
             }
         }
@@ -1073,8 +1135,12 @@ namespace NinjaTrader.NinjaScript.AddOns
 
                 CbiExecution ex = e.Execution;
 
-                if (!RecordExecution(ex))
+                bool opened;
+                if (!RecordExecution(ex, out opened))
                     return;                                   // duplicate event for an execution already seen
+
+                if (opened)
+                    CheckReentryAfterFlatten(ex);
 
                 if (!cfgEnableExecutions || stopping)
                     return;
@@ -1093,6 +1159,13 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private bool RecordExecution(CbiExecution ex)
         {
+            bool opened;
+            return RecordExecution(ex, out opened);
+        }
+
+        private bool RecordExecution(CbiExecution ex, out bool opened)
+        {
+            opened = false;
             if (ex == null || ex.Instrument == null || ex.Quantity <= 0)
                 return false;
 
@@ -1103,23 +1176,17 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             lock (statsLock)
             {
-                if (!seenExecutionIds.Add(id))
+                if (seenExecutionIds.ContainsKey(id))
                     return false;
-
-                if (seenExecutionIds.Count > 50000)
-                {
-                    seenExecutionIds.Clear();
-                    seenExecutionIds.Add(id);
-                }
-
-                ApplyExecutionLocked(ex);
+                seenExecutionIds[id] = DateTime.UtcNow;
+                opened = ApplyExecutionLocked(ex);
             }
             return true;
         }
 
         // FIFO lot matching per account+instrument. A "trade" is a flat-to-flat round trip;
         // a reversal closes the current trade and opens a new one with the remainder.
-        private void ApplyExecutionLocked(CbiExecution ex)
+        private bool ApplyExecutionLocked(CbiExecution ex)
         {
             int qty = ex.Quantity;
             int dir = ex.MarketPosition == MarketPosition.Long ? 1 : -1;
@@ -1138,10 +1205,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 books[key] = book;
             }
 
-            stats.Executions++;
+            SessionStats st = StatsFor(accountName);
+            st.Executions++;
             tradedInstruments[ex.Instrument.FullName] = ex.Instrument;
-            stats.Contracts  += qty;
-            stats.Commission += commission;
+            st.Contracts  += qty;
+            st.Commission += commission;
             book.TradeCommission += commission;
 
             int remaining = qty;
@@ -1156,7 +1224,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     double pnl = (ex.Price - lot.Price) * matched * pointValue * positionDir;
 
                     book.TradeGross += pnl;
-                    stats.Gross     += pnl;
+                    st.Gross        += pnl;
 
                     lot.Quantity -= matched;
                     remaining    -= matched;
@@ -1175,28 +1243,43 @@ namespace NinjaTrader.NinjaScript.AddOns
                 book.Lots.Add(new Lot { Price = ex.Price, Quantity = remaining });
                 book.Net += dir * remaining;
             }
+
+            return remaining > 0;                              // true when the fill opened or added to a position
         }
 
         private void FinalizeTradeLocked(PositionBook book)
         {
+            SessionStats st = StatsFor(book.AccountName);
             double net = book.TradeGross - book.TradeCommission;
-            stats.Trades++;
+            st.Trades++;
             if (net > 0.005)
             {
-                stats.Wins++;
-                stats.LargestWin = Math.Max(stats.LargestWin, net);
+                st.Wins++;
+                st.LargestWin = Math.Max(st.LargestWin, net);
             }
             else if (net < -0.005)
             {
-                stats.Losses++;
-                stats.LargestLoss = Math.Min(stats.LargestLoss, net);
+                st.Losses++;
+                st.LargestLoss = Math.Min(st.LargestLoss, net);
             }
             else
             {
-                stats.Scratches++;
+                st.Scratches++;
             }
             book.TradeGross = 0;
             book.TradeCommission = 0;
+        }
+
+        // Statistics for one account. Call with statsLock held.
+        private SessionStats StatsFor(string account)
+        {
+            SessionStats st;
+            if (!acctStats.TryGetValue(account, out st))
+            {
+                st = new SessionStats();
+                acctStats[account] = st;
+            }
+            return st;
         }
 
         #endregion
@@ -1237,13 +1320,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                     {
                         AccountName = account,
                         ActionText  = DescribeAction(ex),
-                        OrderName   = ex.Order != null ? ex.Order.Name : string.Empty
+                        OrderName   = ex.Order != null ? ex.Order.Name : string.Empty,
+                        FirstTime   = ex.Time
                     };
                     g.Legs[account] = leg;
                 }
                 leg.Quantity  += ex.Quantity;
                 leg.Notional  += ex.Price * ex.Quantity;
                 leg.FillCount += 1;
+                if (ex.Time < leg.FirstTime)
+                    leg.FirstTime = ex.Time;
             }
 
             if (schedule)
@@ -1267,7 +1353,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                         return;
                     pendingFills.Remove(key);
                 }
-                EnqueueText(BuildFillMessage(g));
+                PublishFillGroup(g);
             }
             catch (Exception ex)
             {
@@ -1284,12 +1370,20 @@ namespace NinjaTrader.NinjaScript.AddOns
                 pendingFills.Clear();
             }
             foreach (FillGroup g in pending)
-                EnqueueText(BuildFillMessage(g));
+                PublishFillGroup(g);
+        }
+
+        private void PublishFillGroup(FillGroup g)
+        {
+            if (cfgEnableExecutions)
+                EnqueueQuiet(BuildFillMessage(g));
+            try { RecordCopyQuality(g); } catch (Exception ex) { WriteError("Copy quality", ex); }
+            try { WriteFillCsv(g); } catch (Exception ex) { WriteError("Fill CSV", ex); }
         }
 
         private string BuildFillMessage(FillGroup g)
         {
-            string leaderName = ResolveLeaderName();
+            string leaderName = !string.IsNullOrEmpty(g.SimLeader) ? g.SimLeader : ResolveLeaderName();
             List<FillLeg> legs = g.Legs.Values
                 .OrderBy(l => l.AccountName.Equals(leaderName, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
                 .ThenBy(l => l.AccountName, StringComparer.OrdinalIgnoreCase)
@@ -1326,7 +1420,7 @@ namespace NinjaTrader.NinjaScript.AddOns
               .Append(Sep).Append(TimeText(g.FirstTime)).Append("\n");
 
             FillLeg leader = legs.FirstOrDefault(l => l.AccountName.Equals(leaderName, StringComparison.OrdinalIgnoreCase));
-            double tick = TickSizeOf(g.Instrument);
+            double tick = g.SimTick > 0 ? g.SimTick : TickSizeOf(g.Instrument);
 
             foreach (FillLeg leg in legs)
             {
@@ -1368,14 +1462,34 @@ namespace NinjaTrader.NinjaScript.AddOns
             return 0.0;
         }
 
-        // Positive difference = the follower did worse than the leader (paid more on a buy, received less on a sell).
         private static string DescribeDifference(bool isBuy, double leaderAvg, double followerAvg, double tick)
         {
-            double ticks = (isBuy ? followerAvg - leaderAvg : leaderAvg - followerAvg) / tick;
+            return DescribeTicks(TickDifference(isBuy, leaderAvg, followerAvg, tick));
+        }
+
+        // Positive = the follower did worse than the leader (paid more on a buy, received less on a sell).
+        private static double TickDifference(bool isBuy, double leaderAvg, double followerAvg, double tick)
+        {
+            return (isBuy ? followerAvg - leaderAvg : leaderAvg - followerAvg) / tick;
+        }
+
+        private static string DescribeTicks(double ticks)
+        {
             double magnitude = Math.Round(Math.Abs(ticks), 1);
             if (magnitude < 0.1)
                 return "same price";
             return magnitude.ToString("0.#", CultureInfo.InvariantCulture) + (magnitude == 1.0 ? " tick " : " ticks ") + (ticks > 0 ? "worse" : "better");
+        }
+
+        private static double PointValueOf(CbiInstrument instrument)
+        {
+            try
+            {
+                if (instrument != null && instrument.MasterInstrument != null && instrument.MasterInstrument.PointValue > 0)
+                    return instrument.MasterInstrument.PointValue;
+            }
+            catch (Exception) { }
+            return 1.0;
         }
 
         // Hides internal copier order ids such as "73-007F6E72"; keeps readable names like "Entry" or "B27_Long".
@@ -1444,13 +1558,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             });
         }
 
-        // One-shot timer re-armed after each poll completes, so polls never overlap and never double-process updates.
         private void ReschedulePoll()
         {
             System.Threading.Timer t = pollTimer;
             if (t == null || terminated)
                 return;
-            try { t.Change(PollIntervalMs, Timeout.Infinite); }
+            try { t.Change(pollFailed ? PollIntervalMs : PollIdleMs, Timeout.Infinite); }
             catch (ObjectDisposedException) { }
         }
 
@@ -1463,14 +1576,20 @@ namespace NinjaTrader.NinjaScript.AddOns
             string url = !backlogDrained
                 ? ApiUrl("getUpdates") + "?offset=-1&timeout=0"
                 : ApiUrl("getUpdates") + "?offset=" + updateOffset.ToString(CultureInfo.InvariantCulture)
-                  + "&timeout=0&allowed_updates=" + Uri.EscapeDataString("[\"message\"]");
+                  + "&timeout=" + Num(PollTimeoutSec)
+                  + "&allowed_updates=" + Uri.EscapeDataString("[\"message\",\"callback_query\"]");
 
+            pollFailed = true;                       // cleared below once a good response is parsed; errors back off for a few seconds
             int code;
             string body;
-            using (HttpResponseMessage resp = await Http.GetAsync(url, ct))
+            using (CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
-                code = (int)resp.StatusCode;
-                body = await resp.Content.ReadAsStringAsync();
+                timeout.CancelAfter(PollHttpTimeoutMs);
+                using (HttpResponseMessage resp = await Http.GetAsync(url, timeout.Token))
+                {
+                    code = (int)resp.StatusCode;
+                    body = await resp.Content.ReadAsStringAsync();
+                }
             }
 
             Dictionary<string, object> root = TryParseObject(body);
@@ -1483,6 +1602,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 WriteThrottled("getUpdates failed: " + desc + hint);
                 return;
             }
+
+            pollFailed = false;
+            lastPollOkUtc = DateTime.UtcNow;
 
             List<object> updates = JsonList(root, "result") ?? new List<object>();
 
@@ -1520,6 +1642,13 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (terminated)
                 return;
 
+            Dictionary<string, object> callback = JsonObject(update, "callback_query");
+            if (callback != null)
+            {
+                await HandleCallbackAsync(callback);
+                return;
+            }
+
             Dictionary<string, object> message = JsonObject(update, "message");
             if (message == null)
                 return;
@@ -1555,17 +1684,35 @@ namespace NinjaTrader.NinjaScript.AddOns
             switch (command)
             {
                 case "/status":
-                    EnqueueText(BuildStatusReport());
+                    EnqueueQuiet(BuildStatusReport());
                     break;
                 case "/flatten":
-                    await ExecuteFlattenAsync();
+                    if (cfgFlattenConfirm)
+                        RequestFlattenConfirmation();
+                    else
+                        await ExecuteFlattenAsync();
+                    break;
+                case "/version":
+                    EnqueueQuiet(EmInfo + " DirectTelegramNotifier v" + AddOnVersion);
+                    break;
+                case "/diag":
+                    EnqueueQuiet(BuildDiagReport());
+                    break;
+                case "/copy":
+                    EnqueueQuiet(BuildCopyReport());
+                    break;
+                case "/eod":
+                    EnqueueQuiet(BuildEodPreview());
+                    break;
+                case "/simulate":
+                    RunSimulation();
                     break;
                 case "/help":
                 case "/start":
-                    EnqueueText(BuildHelpText());
+                    EnqueueQuiet(BuildHelpText());
                     break;
                 default:
-                    EnqueueText(EmInfo + " Unknown command <code>" + Html(command) + "</code>. Send /help.");
+                    EnqueueQuiet(EmInfo + " Unknown command <code>" + Html(command) + "</code>. Send /help.");
                     break;
             }
         }
@@ -1588,6 +1735,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private async Task ExecuteFlattenAsync()
         {
+            lastFlattenUtc = DateTime.UtcNow;
+            reentryAlerted = false;
+
             StringBuilder sb = new StringBuilder();
             sb.Append(EmStop).Append(" <b>FLATTEN SENT</b>\n");
 
@@ -1680,9 +1830,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         private string BuildHelpText()
         {
             return EmInfo + " <b>Commands</b>\n"
-                + "/status \u2014 connections, positions, P&amp;L\n"
+                + "/status \u2014 connections, positions, strategies\n"
                 + "/flatten \u2014 close positions and cancel working orders ("
-                + (cfgUseGlobalFlattenEverything ? "ALL accounts" : "tracked accounts") + ")\n"
+                + (cfgUseGlobalFlattenEverything ? "ALL accounts" : "tracked accounts") + (cfgFlattenConfirm ? ", asks to confirm" : string.Empty) + ")\n"
+                + "/copy \u2014 follower fills vs the leader today\n"
+                + "/eod \u2014 preview the end-of-day report\n"
+                + "/diag \u2014 health and diagnostics\n"
+                + "/simulate \u2014 one sample of every alert (nothing real)\n"
+                + "/version \u2014 add-on version\n"
                 + "/help \u2014 this list";
         }
 
@@ -1719,6 +1874,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                 sb.Append("\n").Append(BuildPositionLines(a, out flat));
                 sb.Append("  P&amp;L: realized ").Append(Money(SafeAccountValue(a, AccountItem.RealizedProfitLoss)))
                   .Append(Sep).Append("open ").Append(Money(SafeAccountValue(a, AccountItem.UnrealizedProfitLoss))).Append("\n");
+
+                lock (statsLock)
+                {
+                    SessionStats st;
+                    if (acctStats.TryGetValue(a.Name, out st))
+                        sb.Append("  Today: ").Append(Num(st.Trades)).Append(st.Trades == 1 ? " trade" : " trades")
+                          .Append(" (").Append(Num(st.Wins)).Append("W / ").Append(Num(st.Losses)).Append("L)\n");
+                }
             }
 
             string copyLine = BuildCopyStatusLine();
@@ -1728,16 +1891,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             sb.Append("\n<b>Strategies</b>\n").Append(BuildStrategiesBlock());
             sb.Append(BuildFeedLines());
 
-            lock (statsLock)
-            {
-                sb.Append("\n<b>Since last EOD report</b>\n");
-                sb.Append("Trades ").Append(Num(stats.Trades))
-                  .Append(" (W ").Append(Num(stats.Wins)).Append(" / L ").Append(Num(stats.Losses)).Append(")")
-                  .Append(Sep).Append("Net ").Append(Money(stats.Gross - stats.Commission))
-                  .Append(Sep).Append("Comm ").Append(Money(-stats.Commission)).Append("\n");
-            }
-
-            sb.Append("Notifier up ").Append(FormatDuration(DateTime.UtcNow - startedUtc));
+            sb.Append("\nNotifier up ").Append(FormatDuration(DateTime.UtcNow - startedUtc));
             return sb.ToString();
         }
 
@@ -1831,58 +1985,86 @@ namespace NinjaTrader.NinjaScript.AddOns
             lock (statsLock)
             {
                 report = BuildEodReportLocked(nowTz);
-                stats = new SessionStats();                      // open lots are kept so carried positions still match correctly
+                acctStats.Clear();                               // open lots are kept so carried positions still match correctly
+                copyStats.Clear();
                 sessionStartNt = NtNow();
                 tradedInstruments.Clear();
             }
 
-            StringBuilder broker = new StringBuilder();
-            List<CbiAccount> accounts = SnapshotTrackedAccounts();
-            if (accounts.Count > 0)
-            {
-                broker.Append("\n\n<b>Broker-reported realized P&amp;L</b>\n");
-                foreach (CbiAccount a in accounts)
-                    broker.Append(Html(a.Name)).Append(": ").Append(Money(SafeAccountValue(a, AccountItem.RealizedProfitLoss))).Append("\n");
-            }
-
-            EnqueueText(report + broker.ToString().TrimEnd('\n'));
+            EnqueueQuiet(report + BuildBrokerBlock());
             WriteOutput("EOD summary queued.");
+        }
+
+        private string BuildBrokerBlock()
+        {
+            List<CbiAccount> accounts = SnapshotTrackedAccounts();
+            if (accounts.Count == 0)
+                return string.Empty;
+
+            StringBuilder sb = new StringBuilder();
+            sb.Append("\n\n<b>Broker-reported realized P&amp;L</b>\n");
+            foreach (CbiAccount a in accounts)
+                sb.Append(Html(a.Name)).Append(": ").Append(Money(SafeAccountValue(a, AccountItem.RealizedProfitLoss))).Append("\n");
+            return sb.ToString().TrimEnd('\n');
         }
 
         private string BuildEodReportLocked(DateTime nowTz)
         {
-            SessionStats s = stats;
-            double net = s.Gross - s.Commission;
+            string leaderName = ResolveLeaderName();
 
             StringBuilder sb = new StringBuilder();
             sb.Append(EmChart).Append(" <b>END OF DAY</b>").Append(Sep).Append(nowTz.ToString("ddd yyyy-MM-dd", CultureInfo.InvariantCulture)).Append("\n");
-            sb.Append("<i>Since ").Append(sessionStartNt.ToString("ddd HH:mm", CultureInfo.InvariantCulture)).Append(" (NinjaTrader time)</i>\n\n");
+            sb.Append("<i>Since ").Append(sessionStartNt.ToString("ddd HH:mm", CultureInfo.InvariantCulture)).Append(" (NinjaTrader time)</i>\n");
 
-            sb.Append("Trades <b>").Append(Num(s.Trades)).Append("</b>").Append(Sep)
-              .Append("W ").Append(Num(s.Wins)).Append(" / L ").Append(Num(s.Losses)).Append(" / BE ").Append(Num(s.Scratches));
-            if (s.Trades > 0)
-                sb.Append(Sep).Append((100.0 * s.Wins / s.Trades).ToString("0", CultureInfo.InvariantCulture)).Append("% win");
-            sb.Append("\n");
+            List<KeyValuePair<string, SessionStats>> accounts = acctStats
+                .OrderBy(kv => kv.Key.Equals(leaderName, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                .ThenBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
-            sb.Append("Gross ").Append(Money(s.Gross)).Append(Sep).Append("Comm ").Append(Money(-s.Commission))
-              .Append(Sep).Append("<b>Net ").Append(Money(net)).Append("</b>\n");
+            if (accounts.Count == 0)
+                sb.Append("\nNo trades.");
 
-            if (s.Wins > 0 || s.Losses > 0)
+            foreach (KeyValuePair<string, SessionStats> kv in accounts)
             {
-                List<string> extremes = new List<string>();
-                if (s.Wins > 0)
-                    extremes.Add("Best " + Money(s.LargestWin));
-                if (s.Losses > 0)
-                    extremes.Add("Worst " + Money(s.LargestLoss));
-                sb.Append(string.Join(Sep, extremes.ToArray())).Append("\n");
+                SessionStats s = kv.Value;
+                sb.Append("\n<b>").Append(Html(kv.Key)).Append("</b>");
+                if (kv.Key.Equals(leaderName, StringComparison.OrdinalIgnoreCase) && AccountFilterHasSeveral())
+                    sb.Append(" (leader)");
+                sb.Append("\n");
+
+                sb.Append("Trades ").Append(Num(s.Trades)).Append(Sep)
+                  .Append("W ").Append(Num(s.Wins)).Append(" / L ").Append(Num(s.Losses)).Append(" / BE ").Append(Num(s.Scratches));
+                if (s.Trades > 0)
+                    sb.Append(Sep).Append((100.0 * s.Wins / s.Trades).ToString("0", CultureInfo.InvariantCulture)).Append("% win");
+                sb.Append("\n");
+
+                if (s.Commission > 0)
+                    sb.Append("Gross ").Append(Money(s.Gross)).Append(Sep).Append("Comm ").Append(Money(-s.Commission))
+                      .Append(Sep).Append("<b>Net ").Append(Money(s.Gross - s.Commission)).Append("</b>\n");
+                else
+                    sb.Append("<b>Gross ").Append(Money(s.Gross)).Append("</b>").Append(Sep).Append("<i>fees not in fills</i>\n");
+
+                if (s.Wins > 0 || s.Losses > 0)
+                {
+                    List<string> extremes = new List<string>();
+                    if (s.Wins > 0)
+                        extremes.Add("Best " + Money(s.LargestWin));
+                    if (s.Losses > 0)
+                        extremes.Add("Worst " + Money(s.LargestLoss));
+                    sb.Append(string.Join(Sep, extremes.ToArray())).Append("\n");
+                }
+
+                sb.Append("Executions ").Append(Num(s.Executions)).Append(" (").Append(Num(s.Contracts)).Append(" contracts)\n");
             }
 
-            sb.Append("Executions ").Append(Num(s.Executions)).Append(" (").Append(Num(s.Contracts)).Append(" contracts)");
+            string quality = BuildCopyQualityBlock();
+            if (quality.Length > 0)
+                sb.Append("\n").Append(quality);
 
             List<PositionBook> open = books.Values.Where(b => b.Net != 0).ToList();
             if (open.Count > 0)
             {
-                sb.Append("\n\n<b>Still open</b> (not counted as trades)\n");
+                sb.Append("\n<b>Still open</b> (not counted as trades)\n");
                 foreach (PositionBook b in open)
                 {
                     sb.Append(Html(b.AccountName)).Append(Sep).Append(b.Net > 0 ? "Long " : "Short ").Append(Num(Math.Abs(b.Net)))
@@ -1973,8 +2155,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; }
             catch (Exception) { }
+            // The long poll holds one connection open; keep room for sends and button answers alongside it.
+            try { ServicePointManager.FindServicePoint(new Uri(TelegramApiBase)).ConnectionLimit = 8; }
+            catch (Exception) { }
             HttpClient client = new HttpClient();
-            client.Timeout = TimeSpan.FromSeconds(30);
+            client.Timeout = Timeout.InfiniteTimeSpan;          // every request sets its own timeout
             return client;
         }
 
@@ -1983,10 +2168,27 @@ namespace NinjaTrader.NinjaScript.AddOns
             return TelegramApiBase + resolvedToken + "/" + method;
         }
 
+        // Loud alert: always notifies.
         private void EnqueueText(string text)
         {
+            Enqueue(text, false, null);
+        }
+
+        // Routine message: silent when SilentRoutineAlerts is on.
+        private void EnqueueQuiet(string text)
+        {
+            Enqueue(text, cfgSilentRoutine, null);
+        }
+
+        private void EnqueueWithButtons(string text, string replyMarkup)
+        {
+            Enqueue(text, false, replyMarkup);
+        }
+
+        private void Enqueue(string text, bool silent, string replyMarkup)
+        {
             LogAlert(text);
-            sendQueue.Enqueue(new OutboundMessage { Text = text ?? string.Empty, CreatedUtc = DateTime.UtcNow });
+            sendQueue.Enqueue(new OutboundMessage { Text = text ?? string.Empty, CreatedUtc = DateTime.UtcNow, Silent = silent, ReplyMarkup = replyMarkup });
             try { sendSignal.Release(); } catch (Exception) { }
         }
 
@@ -2061,20 +2263,46 @@ namespace NinjaTrader.NinjaScript.AddOns
                 text = EmClock + " <i>Delayed alert, raised at "
                     + TimeText(NtNow() - (DateTime.UtcNow - msg.CreatedUtc)) + "</i>\n" + text;
             }
+            if (msg.Plain)
+                text = ToPlainText(text);
 
+            List<KeyValuePair<string, string>> fields = new List<KeyValuePair<string, string>>();
+            fields.Add(new KeyValuePair<string, string>("chat_id", chatIdText));
+            fields.Add(new KeyValuePair<string, string>("text", Truncate(text, MaxTextLength)));
+            if (!msg.Plain)
+                fields.Add(new KeyValuePair<string, string>("parse_mode", "HTML"));
+            fields.Add(new KeyValuePair<string, string>("disable_web_page_preview", "true"));
+            if (msg.Silent)
+                fields.Add(new KeyValuePair<string, string>("disable_notification", "true"));
+            if (!string.IsNullOrEmpty(msg.ReplyMarkup))
+                fields.Add(new KeyValuePair<string, string>("reply_markup", msg.ReplyMarkup));
+
+            System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
             try
             {
-                using (FormUrlEncodedContent content = new FormUrlEncodedContent(new[]
+                using (CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(ct))
                 {
-                    new KeyValuePair<string, string>("chat_id", chatIdText),
-                    new KeyValuePair<string, string>("text", Truncate(text, MaxTextLength)),
-                    new KeyValuePair<string, string>("parse_mode", "HTML"),
-                    new KeyValuePair<string, string>("disable_web_page_preview", "true")
-                }))
-                using (HttpResponseMessage resp = await Http.PostAsync(ApiUrl("sendMessage"), content, ct))
-                {
-                    string body = await resp.Content.ReadAsStringAsync();
-                    return InterpretResponse(resp, body);
+                    timeout.CancelAfter(SendTimeoutMs);
+                    using (FormUrlEncodedContent content = new FormUrlEncodedContent(fields))
+                    using (HttpResponseMessage resp = await Http.PostAsync(ApiUrl("sendMessage"), content, timeout.Token))
+                    {
+                        string body = await resp.Content.ReadAsStringAsync();
+                        SendOutcome outcome = InterpretResponse(resp, body);
+
+                        if (outcome.Result == SendResult.Sent)
+                        {
+                            lastSendOkUtc = DateTime.UtcNow;
+                            lastSendMs = (int)watch.ElapsedMilliseconds;
+                        }
+                        else if (outcome.Result == SendResult.Permanent && !msg.Plain
+                                 && body != null && body.IndexOf("parse entities", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            // Telegram could not parse the formatting: resend as plain text instead of losing the alert.
+                            msg.Plain = true;
+                            return new SendOutcome(SendResult.Retry, 1);
+                        }
+                        return outcome;
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -2093,7 +2321,10 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             int code = (int)resp.StatusCode;
             if (resp.IsSuccessStatusCode)
+            {
+                NoteServerTime(resp);
                 return new SendOutcome(SendResult.Sent, 0);
+            }
 
             Dictionary<string, object> root = TryParseObject(body);
             string description = JsonString(root, "description") ?? (body ?? string.Empty);
@@ -2350,10 +2581,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (hist.Count >= FlapThreshold)
             {
                 connMutedUntilUtc[key] = now.AddSeconds(FlapMuteSec);
-                EnqueueText(EmWarn + " <b>CONNECTION FLAPPING</b>\n"
-                    + Html(connection) + Sep + Html(channel) + "\n"
-                    + Num(hist.Count) + " drops in " + Num(FlapWindowSec / 60) + " min. Further alerts for this channel are muted for "
-                    + Num(FlapMuteSec / 60) + " min; /status shows the live state.");
+                EnqueueText(MsgFlapping(connection, channel, hist.Count));
                 return true;
             }
             return false;
@@ -2401,24 +2629,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                     return string.Empty;
 
                 bool clean = lines.Length > 1 && lines[1].Trim().Equals("CLEAN", StringComparison.OrdinalIgnoreCase);
-                DateTime lastAliveUtc = new DateTime(ticks, DateTimeKind.Utc);
-                TimeSpan gap = DateTime.UtcNow - lastAliveUtc;
+                TimeSpan gap = DateTime.UtcNow - new DateTime(ticks, DateTimeKind.Utc);
                 if (gap.TotalSeconds < cfgRestartGapThresholdSec)
                     return string.Empty;
 
-                StringBuilder sb = new StringBuilder();
-                sb.Append(clean ? EmInfo + " <b>NINJATRADER RESTARTED</b>" : EmWarn + " <b>NINJATRADER WENT DOWN</b>")
-                  .Append(Sep).Append("down ").Append(FormatDuration(gap)).Append("\n");
                 DateTime nowNt = NtNow();
-                DateTime lastAliveNt = nowNt - gap;
-                sb.Append("Last alive ").Append(lastAliveNt.ToString("ddd HH:mm:ss", CultureInfo.InvariantCulture))
-                  .Append(Sep).Append("back ").Append(nowNt.ToString("ddd HH:mm:ss", CultureInfo.InvariantCulture))
-                  .Append(" (NinjaTrader time)\n");
-                sb.Append(clean
-                    ? "Exit: normal (closed or restarted)\n"
-                    : "Exit: <b>abnormal</b> (crash, forced kill, power loss, or no shutdown handler)\n");
-                sb.Append("Connections and positions are not restored by the notifier. Check /status.");
-                return sb.ToString();
+                return MsgRestart(clean, gap, nowNt - gap, nowNt);
             }
             catch (Exception ex)
             {
@@ -2500,6 +2716,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     lock (orderLock)
                         baseline = baselinedAccounts.Add(a.Name);       // first scan of an account only records what already exists
 
+                    HashSet<string> present = new HashSet<string>();
                     foreach (CbiOrder o in orders)
                     {
                         if (o == null)
@@ -2508,6 +2725,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                         string id = a.Name + "|" + (string.IsNullOrEmpty(o.OrderId)
                             ? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(o).ToString(CultureInfo.InvariantCulture)
                             : o.OrderId);
+                        present.Add(id);
 
                         bool firstSeen;
                         bool rejectIsNew = false;
@@ -2527,6 +2745,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                         if (cfgEnableOrderRejectAlerts && rejectIsNew)
                             EnqueueText(BuildRejectMessage(a, o));
                     }
+
+                    PruneOrderIds(a.Name, present);
                 }
 
                 if (cfgRunawayMaxOrders > 0)
@@ -2540,20 +2760,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private string BuildRejectMessage(CbiAccount a, CbiOrder o)
         {
-            StringBuilder sb = new StringBuilder();
-            sb.Append(EmSiren).Append(" <b>ORDER REJECTED</b>\n");
-            sb.Append(Html(o.OrderAction.ToString())).Append(" ").Append(Html(o.OrderType.ToString())).Append(" ")
-              .Append(Convert.ToString(o.Quantity, CultureInfo.InvariantCulture)).Append(" \u00D7 ")
-              .Append(Html(o.Instrument != null ? o.Instrument.FullName : "?")).Append(Sep).Append(Html(a.Name)).Append("\n");
-            if (!string.IsNullOrEmpty(o.Name))
-                sb.Append("Name: ").Append(Html(o.Name)).Append("\n");
-
             string reason = FirstUsefulText(GetMember(o, "Comment"), GetMember(o, "Error"), GetMember(o, "NativeError"));
-            if (reason.Length > 0)
-                sb.Append("Reason: ").Append(Html(Truncate(reason, 300))).Append("\n");
-
-            sb.Append("<i>If this was a stop or exit, the position may be unprotected. Check /status.</i>");
-            return sb.ToString();
+            return MsgReject(a.Name, o.Instrument != null ? o.Instrument.FullName : "?", o.OrderAction.ToString(), o.OrderType.ToString(),
+                Convert.ToString(o.Quantity, CultureInfo.InvariantCulture), o.Name, reason);
         }
 
         private void CheckRunaway(List<string> newOrders)
@@ -2583,9 +2792,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             if (alert)
             {
-                EnqueueText(EmSiren + " <b>ORDER RATE HIGH</b>\n"
-                    + Num(count) + " new orders in " + Num(cfgRunawayWindowSec) + "s (limit " + Num(cfgRunawayMaxOrders) + "): " + Html(breakdown) + "\n"
-                    + "Possible runaway strategy. Check NinjaTrader now; /flatten closes positions.");
+                EnqueueText(MsgOrderRate(count, cfgRunawayWindowSec, cfgRunawayMaxOrders, breakdown));
             }
         }
 
@@ -2694,6 +2901,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
 
                 List<string> messages = new List<string>();
+                List<string> quietMessages = new List<string>();
                 lock (strategyLock)
                 {
                     bool firstScan = !strategyBaselined;
@@ -2712,9 +2920,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                             strategies[key] = new StrategyInfo { Ref = key, Name = name, AccountName = kv.Key, State = state };
                             if (!firstScan && !IsTerminatedState(state))
                             {
-                                messages.Add(EmPlay + " <b>STRATEGY ENABLED</b>\n"
-                                    + Html(name) + Sep + Html(kv.Key) + "\n"
-                                    + "State: " + Html(state));
+                                quietMessages.Add(MsgStrategyEnabled(name, kv.Key, state));
                             }
                             continue;
                         }
@@ -2726,10 +2932,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                             info.Name = name;
                             if (IsTerminatedState(state) && !IsTerminatedState(previous))
                             {
-                                messages.Add(EmStop + " <b>STRATEGY DISABLED</b>\n"
-                                    + Html(name) + Sep + Html(kv.Key) + "\n"
-                                    + Html(previous) + " \u2192 Terminated\n"
-                                    + "<i>Check the NinjaTrader Log tab for the reason. A disabled strategy can leave a position open and unmanaged: check /status.</i>");
+                                messages.Add(MsgStrategyDisabled(name, kv.Key, previous));
                             }
                         }
                     }
@@ -2739,9 +2942,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                         strategies.Remove(gone.Ref);
                         if (!IsTerminatedState(gone.State))
                         {
-                            messages.Add(EmStop + " <b>STRATEGY REMOVED</b>\n"
-                                + Html(gone.Name) + Sep + Html(gone.AccountName) + "\n"
-                                + "It disappeared from the account while " + Html(gone.State) + ". Check /status.");
+                            messages.Add(MsgStrategyRemoved(gone.Name, gone.AccountName, gone.State));
                         }
                     }
 
@@ -2750,6 +2951,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 
                 foreach (string text in messages)
                     EnqueueText(text);
+                foreach (string text in quietMessages)
+                    EnqueueQuiet(text);
             }
             catch (Exception ex)
             {
@@ -2848,18 +3051,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                         if (silent < cfgStaleDataSeconds)
                         {
                             w.Stale = false;
-                            EnqueueText(EmOk + " <b>MARKET DATA RESUMED</b>\n" + Html(w.Name) + Sep + "after " + FormatDuration(nowUtc - w.StaleSinceUtc));
+                            EnqueueQuiet(MsgDataResumed(w.Name, nowUtc - w.StaleSinceUtc));
                         }
                     }
                     else if (wanted.ContainsKey(w.Name) && silent >= cfgStaleDataSeconds)
                     {
                         w.Stale = true;
                         w.StaleSinceUtc = last;
-                        EnqueueText(EmWarn + " <b>MARKET DATA STALE</b>\n"
-                            + Html(w.Name) + Sep + "no ticks for " + FormatDuration(nowUtc - last) + "\n"
-                            + (exposed.Contains(w.Name) ? "<b>You have a position or working orders here.</b> " : string.Empty)
-                            + "The data connection still reports Connected, so strategies on this instrument may be running blind.\n"
-                            + "<i>On a holiday or early close this can be normal.</i>");
+                        EnqueueText(MsgStale(w.Name, nowUtc - last, exposed.Contains(w.Name)));
                     }
                 }
             }
@@ -3149,6 +3348,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
                 DateTime now = DateTime.UtcNow;
                 List<string> messages = new List<string>();
+                List<string> quietMessages = new List<string>();
 
                 foreach (string inst in instruments)
                 {
@@ -3176,8 +3376,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                             {
                                 mismatches.Remove(inst);
                                 if (st.Alerted)
-                                    messages.Add(EmOk + " <b>COPY IN SYNC</b>\n" + Html(inst) + Sep
-                                        + "followers match the leader again after " + FormatDuration(now - st.FirstUtc));
+                                    quietMessages.Add(MsgInSync(inst, now - st.FirstUtc));
                             }
                             continue;
                         }
@@ -3197,16 +3396,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                         if (!st.Alerted && (now - st.SinceUtc).TotalSeconds >= cfgMismatchSeconds)
                         {
                             st.Alerted = true;
-                            messages.Add(EmWarn + " <b>COPY MISMATCH</b>\n"
-                                + Html(inst) + Sep + "leader " + Html(leader.Name) + " " + FormatNet(lead) + "\n"
-                                + "\u2022 " + string.Join("\n\u2022 ", diffs.ToArray()) + "\n"
-                                + "Out of sync for " + FormatDuration(now - st.FirstUtc) + ". Check the copier and the follower connections.");
+                            messages.Add(MsgMismatch(inst, leader.Name, lead, diffs, now - st.FirstUtc));
                         }
                     }
                 }
 
                 foreach (string text in messages)
                     EnqueueText(text);
+                foreach (string text in quietMessages)
+                    EnqueueQuiet(text);
             }
             catch (Exception ex)
             {
@@ -3251,9 +3449,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return;
             try
             {
-                string plain = System.Text.RegularExpressions.Regex.Replace(text, "<[^>]+>", string.Empty)
-                    .Replace("&amp;", "&").Replace("&lt;", "<").Replace("&gt;", ">")
-                    .Replace("\r", string.Empty).Replace("\n", " | ");
+                string plain = ToPlainText(text).Replace("\r", string.Empty).Replace("\n", " | ");
                 string line = NtNow().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "  " + plain + Environment.NewLine;
 
                 lock (logLock)
@@ -3273,6 +3469,572 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 // Logging must never interfere with alerting.
             }
+        }
+
+        #endregion
+
+        #region Buttons, clock check and diagnostics helpers
+
+        // Optional safety step: /flatten shows Confirm / Cancel buttons. Only your own taps count and a tap is single-use.
+        private void RequestFlattenConfirmation()
+        {
+            string token = Guid.NewGuid().ToString("N").Substring(0, 8);
+            lock (confirmLock)
+            {
+                confirmToken = token;
+                confirmExpiresUtc = DateTime.UtcNow.AddSeconds(FlattenConfirmSec);
+            }
+
+            string markup = "{\"inline_keyboard\":[[{\"text\":\"" + EmStop + " Flatten now\",\"callback_data\":\"flat:" + token
+                + "\"},{\"text\":\"Cancel\",\"callback_data\":\"cancel:" + token + "\"}]]}";
+
+            EnqueueWithButtons(EmWarn + " <b>Confirm flatten?</b>\n"
+                + "Scope: " + (cfgUseGlobalFlattenEverything ? "<b>ALL accounts</b>" : "tracked accounts") + "\n"
+                + "Buttons expire in " + Num(FlattenConfirmSec) + "s.", markup);
+        }
+
+        private async Task HandleCallbackAsync(Dictionary<string, object> callback)
+        {
+            Dictionary<string, object> from = JsonObject(callback, "from");
+            if (from == null || JsonLong(from, "id") != authorizedUserId)
+                return;                                              // not you: ignored silently
+
+            string id = JsonString(callback, "id");
+            string data = JsonString(callback, "data") ?? string.Empty;
+
+            bool isFlatten = data.StartsWith("flat:", StringComparison.Ordinal);
+            bool isCancel = data.StartsWith("cancel:", StringComparison.Ordinal);
+            string token = isFlatten ? data.Substring(5) : (isCancel ? data.Substring(7) : string.Empty);
+
+            bool valid = false;
+            lock (confirmLock)
+            {
+                if (token.Length > 0 && token == confirmToken)
+                {
+                    valid = DateTime.UtcNow <= confirmExpiresUtc;
+                    confirmToken = string.Empty;                     // single use
+                }
+            }
+
+            if (isFlatten && valid)
+            {
+                await AnswerCallbackAsync(id, "Flattening...");
+                await ExecuteFlattenAsync();
+            }
+            else if (isCancel && valid)
+            {
+                await AnswerCallbackAsync(id, "Cancelled");
+            }
+            else
+            {
+                await AnswerCallbackAsync(id, "Expired. Send /flatten again.");
+            }
+        }
+
+        private async Task AnswerCallbackAsync(string callbackId, string text)
+        {
+            if (string.IsNullOrEmpty(callbackId))
+                return;
+            try
+            {
+                CancellationToken life = lifetimeCts != null ? lifetimeCts.Token : CancellationToken.None;
+                using (CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(life))
+                {
+                    timeout.CancelAfter(10000);
+                    using (FormUrlEncodedContent content = new FormUrlEncodedContent(new[]
+                    {
+                        new KeyValuePair<string, string>("callback_query_id", callbackId),
+                        new KeyValuePair<string, string>("text", text)
+                    }))
+                    using (HttpResponseMessage resp = await Http.PostAsync(ApiUrl("answerCallbackQuery"), content, timeout.Token))
+                    {
+                        await resp.Content.ReadAsStringAsync();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!terminated)
+                    WriteThrottled("answerCallbackQuery failed: " + Describe(ex));
+            }
+        }
+
+        // Telegram's own clock (HTTP Date header) vs this PC: a wrong PC clock breaks end-of-day timing and the restart report.
+        private void NoteServerTime(HttpResponseMessage resp)
+        {
+            try
+            {
+                DateTimeOffset? date = resp.Headers.Date;
+                if (!date.HasValue)
+                    return;
+
+                double drift = (date.Value.UtcDateTime - DateTime.UtcNow).TotalSeconds;
+                lastClockDriftSec = drift;
+
+                if (Math.Abs(drift) > ClockDriftAlertSec && (DateTime.UtcNow - clockAlertUtc).TotalHours > 6)
+                {
+                    clockAlertUtc = DateTime.UtcNow;
+                    EnqueueText(MsgClockDrift(drift));
+                }
+            }
+            catch (Exception) { }
+        }
+
+        private static string MsgClockDrift(double driftSec)
+        {
+            return EmWarn + " <b>PC CLOCK OFF</b>\n"
+                + "Telegram's clock differs from this PC by about " + Num((int)Math.Abs(driftSec)) + "s ("
+                + (driftSec > 0 ? "PC is behind" : "PC is ahead") + ").\n"
+                + "End-of-day timing and the restart report depend on it. Sync Windows time (Settings > Time & language > Date & time > Sync now).";
+        }
+
+        private void RememberLine(string line)
+        {
+            lock (linesLock)
+            {
+                recentLines.Enqueue(TimeText(NtNow()) + " " + Truncate(line, 160));
+                while (recentLines.Count > 12)
+                    recentLines.Dequeue();
+            }
+        }
+
+        private static string ToPlainText(string html)
+        {
+            return System.Text.RegularExpressions.Regex.Replace(html ?? string.Empty, "<[^>]+>", string.Empty)
+                .Replace("&amp;", "&").Replace("&lt;", "<").Replace("&gt;", ">");
+        }
+
+        #endregion
+
+        #region Copy quality and fill export
+
+        // Compares each follower's fill with the leader's fill from the same group (same instrument, side and moment).
+        private void RecordCopyQuality(FillGroup g)
+        {
+            string leaderName = ResolveLeaderName();
+            FillLeg leader;
+            if (leaderName.Length == 0 || !g.Legs.TryGetValue(leaderName, out leader))
+                return;
+
+            double tick = TickSizeOf(g.Instrument);
+            if (tick <= 0)
+                return;
+            double pointValue = PointValueOf(g.Instrument);
+
+            foreach (FillLeg leg in g.Legs.Values)
+            {
+                if (ReferenceEquals(leg, leader))
+                    continue;
+
+                double ticks = TickDifference(g.IsBuy, LegAverage(leader), LegAverage(leg), tick);
+                double dollars = -ticks * tick * pointValue * leg.Quantity;
+                double lagMs = (leg.FirstTime - leader.FirstTime).TotalMilliseconds;
+
+                lock (statsLock)
+                {
+                    CopyStat cs;
+                    if (!copyStats.TryGetValue(leg.AccountName, out cs))
+                    {
+                        cs = new CopyStat();
+                        copyStats[leg.AccountName] = cs;
+                    }
+                    cs.Count++;
+                    cs.SumTicks   += ticks;
+                    cs.SumDollars += dollars;
+                    cs.WorstTicks  = Math.Max(cs.WorstTicks, ticks);
+                    cs.SumLagMs   += lagMs;
+                    cs.MaxLagMs    = Math.Max(cs.MaxLagMs, lagMs);
+                }
+            }
+        }
+
+        private string BuildCopyQualityBlock()
+        {
+            List<KeyValuePair<string, CopyStat>> items;
+            lock (statsLock)
+                items = copyStats.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase).ToList();
+            if (items.Count == 0)
+                return string.Empty;
+
+            StringBuilder sb = new StringBuilder();
+            sb.Append("<b>Copy quality</b> (followers vs leader)\n");
+            foreach (KeyValuePair<string, CopyStat> kv in items)
+            {
+                CopyStat cs = kv.Value;
+                double avgTicks = cs.Count > 0 ? cs.SumTicks / cs.Count : 0.0;
+                double avgLag = cs.Count > 0 ? cs.SumLagMs / cs.Count : 0.0;
+
+                sb.Append(Html(kv.Key)).Append(": avg ").Append(DescribeTicks(avgTicks).Replace("same price", "no difference"))
+                  .Append(" per fill").Append(Sep).Append(Money(cs.SumDollars)).Append(" vs leader")
+                  .Append(Sep).Append("lag ").Append(Math.Round(avgLag).ToString("0", CultureInfo.InvariantCulture)).Append(" ms avg, ")
+                  .Append(Math.Round(cs.MaxLagMs).ToString("0", CultureInfo.InvariantCulture)).Append(" max")
+                  .Append(Sep).Append(Num(cs.Count)).Append(cs.Count == 1 ? " fill" : " fills").Append("\n");
+            }
+            return sb.ToString().TrimEnd('\n');
+        }
+
+        private static string FillCsvPath()
+        {
+            return System.IO.Path.Combine(System.IO.Path.GetDirectoryName(ConfigPath()), "DirectTelegramNotifier-fills.csv");
+        }
+
+        private static string CsvField(string value)
+        {
+            value = value ?? string.Empty;
+            return value.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0 ? "\"" + value.Replace("\"", "\"\"") + "\"" : value;
+        }
+
+        // One row per account per fill group; followers also carry the price difference and lag vs the leader.
+        private void WriteFillCsv(FillGroup g)
+        {
+            if (!cfgEnableFillCsv)
+                return;
+
+            string leaderName = ResolveLeaderName();
+            FillLeg leader = null;
+            if (leaderName.Length > 0)
+                g.Legs.TryGetValue(leaderName, out leader);
+            double tick = TickSizeOf(g.Instrument);
+
+            StringBuilder rows = new StringBuilder();
+            foreach (FillLeg leg in g.Legs.Values.OrderBy(l => l.AccountName, StringComparer.OrdinalIgnoreCase))
+            {
+                bool isLeader = leader != null && ReferenceEquals(leg, leader);
+                string role = leader == null ? string.Empty : (isLeader ? "leader" : "follower");
+                string diff = string.Empty;
+                string lag = string.Empty;
+                if (leader != null && !isLeader)
+                {
+                    lag = Math.Round((leg.FirstTime - leader.FirstTime).TotalMilliseconds).ToString("0", CultureInfo.InvariantCulture);
+                    if (tick > 0)
+                        diff = Math.Round(TickDifference(g.IsBuy, LegAverage(leader), LegAverage(leg), tick), 2).ToString("0.##", CultureInfo.InvariantCulture);
+                }
+
+                rows.Append(leg.FirstTime.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(CsvField(leg.AccountName)).Append(',').Append(role).Append(',')
+                    .Append(CsvField(g.InstrumentName)).Append(',').Append(g.IsBuy ? "BUY" : "SELL").Append(',')
+                    .Append(Num(leg.Quantity)).Append(',')
+                    .Append(LegAverage(leg).ToString("0.######", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(Num(leg.FillCount)).Append(',').Append(diff).Append(',').Append(lag).Append("\r\n");
+            }
+
+            string path = FillCsvPath();
+            lock (csvLock)
+            {
+                FileInfo info = new FileInfo(path);
+                if (info.Exists && info.Length > 10 * 1024 * 1024)
+                {
+                    string old = path + ".old";
+                    if (File.Exists(old))
+                        File.Delete(old);
+                    File.Move(path, old);
+                    info = new FileInfo(path);
+                }
+                if (!info.Exists)
+                    File.WriteAllText(path, "time_nt,account,role,instrument,side,qty,avg_price,fills,ticks_worse_than_leader,lag_ms_vs_leader\r\n", new UTF8Encoding(false));
+                File.AppendAllText(path, rows.ToString(), new UTF8Encoding(false));
+            }
+        }
+
+        #endregion
+
+        #region Message templates (shared by real alerts and /simulate)
+
+        private static string MsgUiFrozen(int seconds)
+        {
+            return EmWarn + " <b>NINJATRADER UI FROZEN</b>\n"
+                + "No response for " + Num(seconds) + "s. Orders and strategies may be affected. Check the machine.";
+        }
+
+        private static string MsgUiRecovered(TimeSpan blocked)
+        {
+            return EmOk + " <b>UI RECOVERED</b>\nNinjaTrader's UI was blocked for about " + FormatDuration(blocked) + ".";
+        }
+
+        private static string MsgFlapping(string connection, string channel, int drops)
+        {
+            return EmWarn + " <b>CONNECTION FLAPPING</b>\n"
+                + Html(connection) + Sep + Html(channel) + "\n"
+                + Num(drops) + " drops in " + Num(FlapWindowSec / 60) + " min. Further alerts for this channel are muted for "
+                + Num(FlapMuteSec / 60) + " min; /status shows the live state.";
+        }
+
+        private static string MsgStrategyEnabled(string name, string account, string state)
+        {
+            return EmPlay + " <b>STRATEGY ENABLED</b>\n"
+                + Html(name) + Sep + Html(account) + "\n"
+                + "State: " + Html(state);
+        }
+
+        private static string MsgStrategyDisabled(string name, string account, string previous)
+        {
+            return EmStop + " <b>STRATEGY DISABLED</b>\n"
+                + Html(name) + Sep + Html(account) + "\n"
+                + Html(previous) + " \u2192 Terminated\n"
+                + "<i>Check the NinjaTrader Log tab for the reason. A disabled strategy can leave a position open and unmanaged: check /status.</i>";
+        }
+
+        private static string MsgStrategyRemoved(string name, string account, string state)
+        {
+            return EmStop + " <b>STRATEGY REMOVED</b>\n"
+                + Html(name) + Sep + Html(account) + "\n"
+                + "It disappeared from the account while " + Html(state) + ". Check /status.";
+        }
+
+        private static string MsgStale(string instrument, TimeSpan silent, bool exposed)
+        {
+            return EmWarn + " <b>MARKET DATA STALE</b>\n"
+                + Html(instrument) + Sep + "no ticks for " + FormatDuration(silent) + "\n"
+                + (exposed ? "<b>You have a position or working orders here.</b> " : string.Empty)
+                + "The data connection still reports Connected, so strategies on this instrument may be running blind.\n"
+                + "<i>On a holiday or early close this can be normal.</i>";
+        }
+
+        private static string MsgDataResumed(string instrument, TimeSpan after)
+        {
+            return EmOk + " <b>MARKET DATA RESUMED</b>\n" + Html(instrument) + Sep + "after " + FormatDuration(after);
+        }
+
+        // diffs are already HTML-escaped lines such as "Account2: Flat, expected Long 3".
+        private static string MsgMismatch(string instrument, string leaderName, int leaderNet, List<string> diffs, TimeSpan outOfSync)
+        {
+            return EmWarn + " <b>COPY MISMATCH</b>\n"
+                + Html(instrument) + Sep + "leader " + Html(leaderName) + " " + FormatNet(leaderNet) + "\n"
+                + "\u2022 " + string.Join("\n\u2022 ", diffs.ToArray()) + "\n"
+                + "Out of sync for " + FormatDuration(outOfSync) + ". Check the copier and the follower connections.";
+        }
+
+        private static string MsgInSync(string instrument, TimeSpan after)
+        {
+            return EmOk + " <b>COPY IN SYNC</b>\n" + Html(instrument) + Sep + "followers match the leader again after " + FormatDuration(after);
+        }
+
+        private static string MsgOrderRate(int count, int windowSec, int limit, string breakdown)
+        {
+            return EmSiren + " <b>ORDER RATE HIGH</b>\n"
+                + Num(count) + " new orders in " + Num(windowSec) + "s (limit " + Num(limit) + "): " + Html(breakdown) + "\n"
+                + "Possible runaway strategy. Check NinjaTrader now; /flatten closes positions.";
+        }
+
+        private static string MsgReject(string account, string instrument, string action, string type, string qty, string name, string reason)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append(EmSiren).Append(" <b>ORDER REJECTED</b>\n");
+            sb.Append(Html(action)).Append(" ").Append(Html(type)).Append(" ").Append(Html(qty)).Append(" \u00D7 ")
+              .Append(Html(instrument)).Append(Sep).Append(Html(account)).Append("\n");
+
+            string cleanName = CleanOrderName(name);
+            if (cleanName.Length > 0)
+                sb.Append("Name: ").Append(Html(cleanName)).Append("\n");
+            if (!string.IsNullOrEmpty(reason))
+                sb.Append("Reason: ").Append(Html(Truncate(reason, 300))).Append("\n");
+
+            sb.Append("<i>If this was a stop or exit, the position may be unprotected. Check /status.</i>");
+            return sb.ToString();
+        }
+
+        private static string MsgRestart(bool clean, TimeSpan gap, DateTime lastAliveNt, DateTime nowNt)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append(clean ? EmInfo + " <b>NINJATRADER RESTARTED</b>" : EmWarn + " <b>NINJATRADER WENT DOWN</b>")
+              .Append(Sep).Append("down ").Append(FormatDuration(gap)).Append("\n");
+            sb.Append("Last alive ").Append(lastAliveNt.ToString("ddd HH:mm:ss", CultureInfo.InvariantCulture))
+              .Append(Sep).Append("back ").Append(nowNt.ToString("ddd HH:mm:ss", CultureInfo.InvariantCulture))
+              .Append(" (NinjaTrader time)\n");
+            sb.Append(clean
+                ? "Exit: normal (closed or restarted)\n"
+                : "Exit: <b>abnormal</b> (crash, forced kill, power loss, or no shutdown handler)\n");
+            sb.Append("Connections and positions are not restored by the notifier. Check /status.");
+            return sb.ToString();
+        }
+
+        private static string MsgReentry(string account, string instrument, string side, int qty, string name, int secondsAfter)
+        {
+            return EmSiren + " <b>RE-ENTERED AFTER FLATTEN</b>\n"
+                + Html(account) + Sep + side + " " + Num(qty) + " \u00D7 " + Html(instrument)
+                + (string.IsNullOrEmpty(name) ? string.Empty : Sep + Html(name)) + "\n"
+                + "A position opened " + Num(secondsAfter) + "s after /flatten, so a strategy (or the copier) is trading again.\n"
+                + "<i>/flatten does not disable strategies. Disable the strategy in the Strategies tab to stay flat.</i>";
+        }
+
+        #endregion
+
+        #region Diagnostics, simulation and flatten safety
+
+        private void CheckReentryAfterFlatten(CbiExecution ex)
+        {
+            if (reentryAlerted)
+                return;
+            double since = (DateTime.UtcNow - lastFlattenUtc).TotalSeconds;
+            if (since > ReentryWindowSec)
+                return;
+
+            string orderName = ex.Order != null ? ex.Order.Name : string.Empty;
+            if (string.Equals(orderName, "Close", StringComparison.OrdinalIgnoreCase))
+                return;                                               // the flatten's own close orders
+
+            reentryAlerted = true;
+            EnqueueText(MsgReentry(AccountNameOf(ex), ex.Instrument.FullName,
+                ex.MarketPosition == MarketPosition.Long ? "BUY" : "SELL", ex.Quantity, CleanOrderName(orderName), (int)since));
+        }
+
+        private void PruneTrackingSets()
+        {
+            if ((DateTime.UtcNow - lastPruneUtc).TotalMinutes < 10)
+                return;
+            lastPruneUtc = DateTime.UtcNow;
+
+            DateTime cutoff = DateTime.UtcNow.AddHours(-72);
+            lock (statsLock)
+            {
+                List<string> old = seenExecutionIds.Where(kv => kv.Value < cutoff).Select(kv => kv.Key).ToList();
+                foreach (string key in old)
+                    seenExecutionIds.Remove(key);
+            }
+        }
+
+        // Orders that NinjaTrader no longer lists can never come back, so their ids can be forgotten.
+        private void PruneOrderIds(string accountName, HashSet<string> present)
+        {
+            string prefix = accountName + "|";
+            lock (orderLock)
+            {
+                List<string> goneSeen = seenOrderIds.Where(id1 => id1.StartsWith(prefix, StringComparison.Ordinal) && !present.Contains(id1)).ToList();
+                foreach (string key in goneSeen)
+                    seenOrderIds.Remove(key);
+
+                List<string> goneRejected = rejectedAlerted.Where(id2 => id2.StartsWith(prefix, StringComparison.Ordinal) && !present.Contains(id2)).ToList();
+                foreach (string key in goneRejected)
+                    rejectedAlerted.Remove(key);
+            }
+        }
+
+        private static string Ago(DateTime utc)
+        {
+            return FormatDuration(DateTime.UtcNow - utc) + " ago";
+        }
+
+        private string BuildDiagReport()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append(EmInfo).Append(" <b>DIAGNOSTICS</b>").Append(Sep).Append(TimeText(NtNow())).Append("\n");
+            sb.Append("v").Append(AddOnVersion).Append(Sep).Append("up ").Append(FormatDuration(DateTime.UtcNow - startedUtc)).Append("\n\n");
+
+            sb.Append("<b>Telegram</b>\n");
+            sb.Append("  Last send: ").Append(lastSendOkUtc == DateTime.MinValue ? "none yet" : Ago(lastSendOkUtc) + " (" + Num(lastSendMs) + " ms)").Append("\n");
+            sb.Append("  Last poll: ").Append(lastPollOkUtc == DateTime.MinValue ? "none yet" : Ago(lastPollOkUtc)).Append("\n");
+            sb.Append("  Waiting to send: ").Append(Num(sendQueue.Count)).Append("\n");
+            sb.Append("  PC clock vs Telegram: ").Append(lastClockDriftSec.ToString("+0.0;-0.0;0.0", CultureInfo.InvariantCulture)).Append("s\n\n");
+
+            int running;
+            lock (strategyLock)
+                running = strategies.Values.Count(x => !IsTerminatedState(x.State));
+            int feedCount;
+            lock (feedLock)
+                feedCount = feeds.Values.Count(x => x.Subscribed);
+
+            sb.Append("<b>Monitoring</b>\n");
+            sb.Append("  Accounts ").Append(Num(SnapshotTrackedAccounts().Count)).Append(Sep)
+              .Append("strategies running ").Append(Num(running)).Append(Sep)
+              .Append("data feeds ").Append(Num(feedCount)).Append("\n");
+            try
+            {
+                using (System.Diagnostics.Process p = System.Diagnostics.Process.GetCurrentProcess())
+                {
+                    sb.Append("  NinjaTrader memory ").Append(Num((int)(p.WorkingSet64 / (1024 * 1024)))).Append(" MB").Append(Sep)
+                      .Append(Num(p.Threads.Count)).Append(" threads\n");
+                }
+            }
+            catch (Exception) { }
+
+            sb.Append("\n<b>Settings</b>\n");
+            sb.Append("  EOD ").Append(eodTimeOfDay.ToString(@"hh\:mm")).Append(Sep)
+              .Append("stale-data ").Append(cfgStaleDataSeconds > 0 ? Num(cfgStaleDataSeconds) + "s" : "off").Append(Sep)
+              .Append("order-rate ").Append(cfgRunawayMaxOrders > 0 ? Num(cfgRunawayMaxOrders) + "/" + Num(cfgRunawayWindowSec) + "s" : "off").Append(Sep)
+              .Append("copy check ").Append(cfgMismatchSeconds > 0 ? Num(cfgMismatchSeconds) + "s" : "off").Append("\n");
+            sb.Append("  Heartbeat ").Append(string.IsNullOrEmpty(cfgHeartbeatUrl) ? "off" : "on").Append(Sep)
+              .Append("flatten confirm ").Append(cfgFlattenConfirm ? "on" : "off").Append(Sep)
+              .Append("silent routine ").Append(cfgSilentRoutine ? "on" : "off").Append(Sep)
+              .Append("fill CSV ").Append(cfgEnableFillCsv ? "on" : "off").Append("\n");
+
+            List<string> lines;
+            lock (linesLock)
+                lines = recentLines.ToList();
+            if (lines.Count > 0)
+            {
+                sb.Append("\n<b>Recent log</b>\n");
+                foreach (string line in lines.Skip(Math.Max(0, lines.Count - 6)))
+                    sb.Append("<code>").Append(Html(Truncate(line, 120))).Append("</code>\n");
+            }
+            return sb.ToString().TrimEnd('\n');
+        }
+
+        private string BuildCopyReport()
+        {
+            string quality = BuildCopyQualityBlock();
+            if (quality.Length == 0)
+                return EmInfo + " No leader vs follower fills compared since the last end-of-day report.";
+            return EmChart + " " + quality;
+        }
+
+        private string BuildEodPreview()
+        {
+            DateTime nowTz = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, eodTimeZone);
+            string report;
+            lock (statsLock)
+                report = BuildEodReportLocked(nowTz);
+            return EmInfo + " <b>PREVIEW</b> (nothing was reset)\n\n" + report + BuildBrokerBlock();
+        }
+
+        // Sends one sample of every alert, built by the same code as the real ones. Nothing is changed or flattened.
+        private void RunSimulation()
+        {
+            const string tag = "\n<i>(simulated)</i>";
+            string leader = ResolveLeaderName();
+            if (leader.Length == 0)
+                leader = "LeaderAccount";
+            string follower1 = "FollowerAccount1";
+            string follower2 = "FollowerAccount2";
+            DateTime now = NtNow();
+
+            EnqueueQuiet(EmInfo + " <b>SIMULATION</b>\nSample alerts follow. Nothing is wrong and nothing was changed.");
+
+            FillGroup copied = new FillGroup { InstrumentName = "MNQ DEC26", IsBuy = true, FirstTime = now, SimLeader = leader, SimTick = 0.25 };
+            copied.Legs[leader]    = new FillLeg { AccountName = leader,    ActionText = "Buy", Quantity = 3, Notional = 3 * 29411.00, FillCount = 1, FirstTime = now };
+            copied.Legs[follower1] = new FillLeg { AccountName = follower1, ActionText = "Buy", Quantity = 3, Notional = 3 * 29410.00, FillCount = 1, FirstTime = now.AddMilliseconds(180) };
+            copied.Legs[follower2] = new FillLeg { AccountName = follower2, ActionText = "Buy", Quantity = 3, Notional = 3 * 29411.25, FillCount = 2, FirstTime = now.AddMilliseconds(420) };
+            EnqueueQuiet(BuildFillMessage(copied) + tag);
+
+            FillGroup single = new FillGroup { InstrumentName = "MNQ DEC26", IsBuy = false, FirstTime = now };
+            single.Legs[leader] = new FillLeg { AccountName = leader, ActionText = "Sell", OrderName = "ProfitTarget", Quantity = 3, Notional = 3 * 29435.75, FillCount = 1, FirstTime = now };
+            EnqueueQuiet(BuildFillMessage(single) + tag);
+
+            ConnNotice down = new ConnNotice { Connection = "MFFU", Down = true, Lost = true, Time = now, Detail = "Server closed the connection" };
+            down.Channels.Add("orders");
+            down.Channels.Add("data");
+            EnqueueText(BuildConnectionMessage(down) + tag);
+
+            ConnNotice up = new ConnNotice { Connection = "MFFU", Down = false, Time = now, Downtime = TimeSpan.FromSeconds(12) };
+            up.Channels.Add("orders");
+            up.Channels.Add("data");
+            EnqueueQuiet(BuildConnectionMessage(up) + tag);
+
+            EnqueueText(MsgFlapping("MFFU", "orders", 4) + tag);
+            EnqueueText(MsgUiFrozen(52) + tag);
+            EnqueueQuiet(MsgUiRecovered(TimeSpan.FromSeconds(71)) + tag);
+            EnqueueText(MsgStrategyDisabled("MyStrategy", leader, "Realtime") + tag);
+            EnqueueQuiet(MsgStrategyEnabled("MyStrategy", leader, "Realtime") + tag);
+            EnqueueText(MsgStale("MNQ DEC26", TimeSpan.FromSeconds(140), true) + tag);
+            EnqueueQuiet(MsgDataResumed("MNQ DEC26", TimeSpan.FromSeconds(185)) + tag);
+            EnqueueText(MsgMismatch("MNQ DEC26", leader, 3, new List<string> { Html(follower1) + ": Flat, expected Long 3" }, TimeSpan.FromSeconds(25)) + tag);
+            EnqueueQuiet(MsgInSync("MNQ DEC26", TimeSpan.FromSeconds(48)) + tag);
+            EnqueueText(MsgOrderRate(34, cfgRunawayWindowSec, cfgRunawayMaxOrders, "MNQ DEC26 \u00D730, ES DEC26 \u00D74") + tag);
+            EnqueueText(MsgReject(leader, "MNQ DEC26", "Sell", "StopMarket", "3", "Stop1", "Order price outside limits") + tag);
+            EnqueueText(MsgReentry(leader, "MNQ DEC26", "BUY", 3, "B27_Long", 14) + tag);
+            EnqueueText(MsgRestart(false, TimeSpan.FromSeconds(372), now.AddSeconds(-372), now) + tag);
+            EnqueueText(MsgClockDrift(21) + tag);
+
+            EnqueueQuiet(EmOk + " <b>Simulation finished</b>");
         }
 
         #endregion
@@ -3314,7 +4076,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     return instrument.MasterInstrument.FormatPrice(price);
             }
             catch (Exception) { }
-            return price.ToString("0.######", CultureInfo.InvariantCulture);
+            return price.ToString("0.00####", CultureInfo.InvariantCulture);
         }
 
         private static string Money(double value)
@@ -3404,7 +4166,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void WriteOutput(string message)
         {
-            try { Print("[DirectTelegramNotifier] " + Redact(message)); }
+            try { string clean = Redact(message); Print("[DirectTelegramNotifier] " + clean); RememberLine(clean); }
             catch (Exception) { }
         }
 

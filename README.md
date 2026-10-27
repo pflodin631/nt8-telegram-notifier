@@ -176,12 +176,12 @@ The config is read at startup only. After editing it, press F5 in the NinjaScrip
 | `SilentRoutineAlerts` | `false` | `true` sends fills, reconnects, reports and command replies without a notification sound |
 | `EnableFillCsv` | `true` | Append every fill and leader-vs-follower comparison to `DirectTelegramNotifier-fills.csv` |
 
+\* Can also be set for one account: `Key:AccountName=value`, for example `DrawdownAmount:Acct002=2500`. Unrecognized keys are reported in Telegram at startup.
+
 ### Worked example
 `config/DirectTelegramNotifier.mffu-rapid-eod-50k.config.example` shows one real setup: three 50k end-of-day
 evaluation accounts with limits also set in the broker. It is an example, not a preset. Firm rules change,
 so check your own plan. Placeholders mark what you must replace.
-
-\* Can also be set for one account: `Key:AccountName=value`, for example `DrawdownAmount:Acct002=2500`. Unrecognized keys are reported in Telegram at startup.
 
 ## Risk: floors, daily loss and locks
 

@@ -1,0 +1,240 @@
+# DirectTelegramNotifier configuration: WORKED EXAMPLE (not a preset)
+# After editing: press F5 in the NinjaScript Editor, or restart NinjaTrader.
+#
+# This is how one real setup looks: THREE MyFundedFutures "Rapid EOD 50K" EVALUATION accounts (one leader, two followers,
+# copied by a trade copier) on a Tradovate connection, where the daily loss, daily profit and weekly loss limits are ALSO set
+# in Tradovate. It sits next to the blank template (DirectTelegramNotifier.config.example) so you can see the keys filled in.
+#
+# It is NOT a firm preset. Firms change their rules and plans differ: the numbers below are what the firm's rules page showed
+# in October 2026 for this plan. Check your own account's rules and your firm's dashboard before copying anything.
+#   Firm rules for this plan:  profit target 3,000 | max drawdown 2,000, end-of-day trailing | 3 contracts max (micros count 10:1)
+#                              30% consistency rule | no daily loss limit | 7 calendar days inactivity
+#   Set in Tradovate (broker-side, enforced there):  daily loss 600 | daily profit limit 850 (keeps every day under 30%) | weekly loss 1,200
+#
+# WHO ENFORCES WHAT. Tradovate's limits are enforced on its servers, so this add-on only MIRRORS them and alerts. The auto-flatten
+# switches for the daily loss and consistency rules are left OFF so two systems do not fight over the same account. Tradovate cannot
+# see the firm's trailing drawdown floor, though: two bad weeks in a row can reach it without the weekly limit ever tripping
+# (1,200 lost one week, 800 the next, from a 2,000 drawdown). The floor is the one rule only this add-on watches.
+#
+# Every line I changed from the blank template has a "# >> MY SETUP" comment above it. Replace the PLACEHOLDERS with your own:
+# account names, Telegram user ID, and (optionally) the heartbeat and backup URLs. Never commit the real file.
+#
+# Things this add-on cannot do for this setup:
+#   - There is no weekly loss limit key. The 1,200 weekly limit lives in Tradovate only.
+#   - There is no daily profit limit key. The consistency tracker below is the closest alert (see ConsistencyProfitTarget).
+
+
+# --- Telegram ---
+# BotToken: from @BotFather. Leave blank to use the NT_TELEGRAM_BOT_TOKEN environment variable instead.
+BotToken=
+# AuthorizedChatID: your numeric Telegram user ID. Alerts go here; only this user can send commands.
+AuthorizedChatID=
+
+# --- Accounts ---
+# AccountName: one account, a comma-separated list, or * for all connected accounts.
+# >> MY SETUP: PLACEHOLDER: your three account names exactly as NinjaTrader shows them, leader first.
+AccountName=MFFUEVREOD000000001,MFFUEVREOD000000002,MFFUEVREOD000000003
+
+# --- Features ---
+EnableWatchdog=true
+EnableExecutions=true
+EnableRemoteCommands=true
+EnableOrderRejectAlerts=true
+# RunawayMaxOrders: alert when this many new orders appear within RunawayWindowSec. 0 = off.
+RunawayMaxOrders=30
+RunawayWindowSec=60
+# true = /flatten calls FlattenEverything() and hits EVERY connected account.
+UseGlobalFlattenEverything=false
+
+# --- End of day ---
+# EodReportTime: HHMMSS in EodTimeZoneId (a Windows time zone id; DST is handled automatically).
+EodReportTime=170000
+EodTimeZoneId=Eastern Standard Time
+# Used only when NinjaTrader reports zero commission for a fill (e.g. Sim without a commission template).
+EstimatedCommissionPerSide=0.95 #MFFU charges $0.95 for every MNQ contract.
+
+# --- Heartbeat and restart detection ---
+# HeartbeatUrl: optional dead-man's-switch ping URL (e.g. from Healthchecks.io). Blank = off.
+# >> MY SETUP: Left blank because the URL is a secret. Recommended: make your own Healthchecks check and send ITS alert to email or SMS, not Telegram.
+HeartbeatUrl=
+HeartbeatIntervalSec=60
+# RestartGapThresholdSec: on startup, report downtime longer than this many seconds.
+RestartGapThresholdSec=45
+
+# --- Monitoring ---
+EnableStrategyWatch=true
+# StaleDataSeconds: alert when an instrument you trade gets no ticks this long while the data connection says Connected. 0 = off.
+StaleDataSeconds=120
+# StaleDataSchedule: when no ticks are expected, so silence is not an alarm.
+#   cme    = CME-style futures week: daily 17:00-18:00 and Fri 17:00 to Sun 18:00, US Eastern
+#   always = the feed should tick around the clock (crypto, or to switch the schedule off)
+#   custom = your own quiet windows below, in StaleDataTimeZone
+StaleDataSchedule=cme
+# StaleDataQuietWindows: used with custom. Semicolon-separated 'Days HH:mm-HH:mm'; days are Mon..Sun, ranges (Mon-Thu), Daily, Weekdays or Weekends.
+# A window cannot cross midnight: split it. Example (US stocks, Eastern): Weekdays 00:00-09:30; Weekdays 16:00-24:00; Weekends 00:00-24:00
+StaleDataQuietWindows=
+# StaleDataTimeZone: Windows time zone id for custom windows, e.g. Eastern Standard Time, Central Europe Standard Time, GMT Standard Time.
+StaleDataTimeZone=Eastern Standard Time
+# StaleDataInstruments: extra instruments to always watch, comma-separated (e.g. MNQ 12-26). Instruments you trade or hold are watched automatically.
+StaleDataInstruments=
+# EnableAlertLog: also append every alert to DirectTelegramNotifier.log in this folder.
+EnableAlertLog=true
+
+# --- Trade copier check (e.g. Replikanto) ---
+# LeaderAccount: the account that leads. Blank = the first account in AccountName. Every other tracked account is a follower.
+# >> MY SETUP: PLACEHOLDER: the account the copier copies from (the first one above; written out so a re-ordered list cannot change it).
+LeaderAccount=MFFUEVREOD000000001
+# FollowerRatio: expected follower position as a multiple of the leader's (1 = same size).
+FollowerRatio=1
+# MismatchSeconds: alert when followers stay out of sync with the leader this long. 0 = off.
+MismatchSeconds=20
+
+# --- Safety checks ---
+# ProtectiveCheckSeconds: alert when an open position has no working stop order for this long. 0 = off.
+# Turn it on only if your strategies place real stop orders (not internal stop logic).
+ProtectiveCheckSeconds=0
+# OrphanOrderSeconds: alert when an account is flat but exit-type orders (name contains one of OrphanOrderNames) keep working this long. 0 = off.
+OrphanOrderSeconds=20
+OrphanOrderNames=Stop,Target
+# StuckOrderSeconds: alert when an order sits in one of StuckOrderStates this long. 0 = off.
+StuckOrderSeconds=30
+# StuckOrderStates: NinjaTrader order states that should pass quickly. Add Accepted only if your broker moves orders past it quickly.
+StuckOrderStates=Submitted,ChangePending,ChangeSubmitted,CancelPending,CancelSubmitted
+# MaxPositionContracts: alert when an account holds more than this many contracts in total. 0 = off.
+# >> MY SETUP: The plan allows 3 contracts. This counts contracts as they are, it does NOT apply the 10:1 micro scaling: if you trade micros, set 30.
+MaxPositionContracts=30
+
+# --- Risk: drawdown floor and daily loss limit ---
+# Enter YOUR rules: these are not firm presets. Check /risk against your broker's or firm's own dashboard.
+# Any line marked (per account) can also be set for one account:  Key:AccountName=value  e.g.  DrawdownAmount:Acct002=2500
+#
+# DrawdownMode (per account): how the floor is found.
+#   off      = no floor checks
+#   manual   = the floor is RiskFloor below, or whatever you set with /floor
+#   static   = StartingBalance - DrawdownAmount; it never moves
+#   eod      = trails the highest end-of-day balance (at EodReportTime): floor = high - DrawdownAmount, capped at FloorLock
+#   intraday = trails the highest live net liquidation, including open profit, capped at FloorLock
+# A /floor setting always overrides the mode until /floor clear.
+# >> MY SETUP: The firm trails the drawdown on the highest end-of-day balance.
+DrawdownMode=eod
+# HighWaterBasis (per account): what a trailing high-water mark is measured on.
+#   balance = closing balance without open profit or loss (net liquidation minus open P&L). Right for end-of-day trailing.
+#   netliq  = net liquidation including open profit. Intraday trailing always uses net liquidation.
+# Firms differ: check which one yours uses. Compare /risk with your firm's dashboard after the first session.
+# >> MY SETUP: End-of-day trailing measured on the closing balance (net liquidation minus open profit). This is the default; written out so it is a visible choice.
+HighWaterBasis=balance
+# RiskFloor (per account): the floor for manual mode, in net liquidation dollars. Blank = none.
+RiskFloor=
+# StartingBalance (per account): account size. Needed for static; trailing modes start from it (else from current net liquidation).
+# >> MY SETUP: Account size. If an account already has banked profit, also use /risk seed (see the README) so the floor starts right.
+StartingBalance=50000
+# DrawdownAmount (per account): the maximum drawdown in dollars, for static, eod and intraday.
+# >> MY SETUP: Maximum drawdown for this plan.
+DrawdownAmount=2000
+# FloorLock (per account): a trailing floor stops rising at this value (often starting balance + a little). Blank = never locks.
+# >> MY SETUP: The trailing floor stops rising at starting balance + 100. Sources differ on when a firm applies the lock: confirm it for your plan.
+FloorLock=50100
+# RiskBufferAlerts: alert as net liquidation comes within these many dollars of the floor.
+# >> MY SETUP: Tighter than the default (1500,750,300) because the whole drawdown is only 2,000.
+RiskBufferAlerts=1000,500,250
+# RiskAutoFlatten: true = an account that stays within RiskFlattenBuffer of its floor for RiskConfirmSeconds is flattened and LOCKED:
+# anything that opens on it afterwards is closed again until /unlock or the session ends. Test on Sim first.
+# >> MY SETUP: Switch to true once you have run the Sim checks in docs/TESTING.md (drive a Sim101 account to its floor, not an evaluation account). It is the only protection against the firm floor.
+RiskAutoFlatten=false
+# >> MY SETUP: Wider than the default 150: a few seconds of delay or one bad fill can move 3 contracts through 150 dollars.
+RiskFlattenBuffer=250
+# RiskConfirmSeconds: how long a breach must last before auto-flatten acts (filters a single bad reading). 1-30.
+RiskConfirmSeconds=2
+# FloorJumpConfirm: /floor asks for a button press when it moves a floor by more than this, or puts it inside your alert levels. 0 = only the latter.
+# >> MY SETUP: With a 2,000 drawdown a 1,000 typo on /floor is too large to wave through.
+FloorJumpConfirm=500
+#
+# UnknownFlattenSeconds: while you hold a position and the risk numbers can't be trusted (data connection down, feed stale,
+# net liquidation unreadable), flatten and lock the account after this many seconds. 0 = never: only alert (every minute).
+# Orders do not need market data, so a flatten still works. A short data blip would cost you the position, so think before using it.
+UnknownFlattenSeconds=0
+# LockGroup: true = when one tracked account is locked, lock them all. Stops a copier from re-opening trades on a locked follower
+# (each re-entry is closed at a small loss), but one account's breach then halts every account.
+# >> MY SETUP: The three accounts mirror each other. If one is locked the copier would keep re-opening trades on it, so lock all of them.
+LockGroup=true
+#
+# DailyLossLimit (per account): maximum loss per session, measured from net liquidation at the session start (EodReportTime).
+# Dollars (1000) or percent of the session-start value (2%). Blank = off.
+# >> MY SETUP: Same figure as the Tradovate daily loss limit, so you get 50/75/90% alerts. Measured from net liquidation at 17:00 ET, which can differ slightly from Tradovate: compare after the first day.
+DailyLossLimit=600
+# DailyLossAlerts: percentages of the limit that alert.
+DailyLossAlerts=50,75,90
+# DailyLossAutoFlatten: true = flatten and lock an account that reaches its daily loss limit.
+# >> MY SETUP: Tradovate already enforces this limit. Leaving the add-on on alerts only avoids two systems acting on one account.
+DailyLossAutoFlatten=false
+#
+# --- Consistency rule (best day as a share of total profit) ---
+# ConsistencyPercent (per account): your firm's limit, e.g. 30, 40 or 50. Blank or 0 = off. Needs StartingBalance.
+# Firms differ (and change their rules): enter the percentage from YOUR account's rules.
+# The notifier shows how much today's profit can reach before today is more than this share of your total profit.
+# >> MY SETUP: The plan has a 30% consistency rule.
+ConsistencyPercent=30
+# ConsistencyProfitTarget (per account): LEAVE BLANK unless your firm measures against the larger of total profit and the profit target.
+# Setting it raises the allowed daily profit to at least percent x target, which overstates your room if your firm does not do that.
+# >> MY SETUP: Deliberate workaround, read this: with the target set, today's allowed profit is never below 30% of 3,000 = 900. That makes the 75% and 90% alerts fire at about 675 and 810, just under the 850 you set in Tradovate. Without it the cap early in the evaluation is tiny and the alerts are noise. The README warns this overstates your room if your firm does not measure against the target; here Tradovate's 850 limit is the real stop.
+ConsistencyProfitTarget=3000
+# ConsistencyAlerts: percentages of today's allowed profit that alert.
+ConsistencyAlerts=75,90
+# ConsistencyAutoFlatten: true = flatten and lock the account when today's profit reaches the cap (stops the day from getting too big).
+# >> MY SETUP: Tradovate's 850 profit limit already stops the day.
+ConsistencyAutoFlatten=false
+
+# --- Inactivity rule ---
+# InactivityDays (per account): your firm closes an account that has not traded for this many days. Blank or 0 = off.
+# Any fill counts as a trade. Check which accounts your firm applies this to (some only to funded accounts).
+# The notifier warns you; it never places a trade. Tell your firm in advance about planned breaks.
+# Example for one account only:  InactivityDays:Acct001=7
+# >> MY SETUP: The plan closes an account after 7 calendar days without a trade. The add-on counts 24-hour days, so treat the last alert day as the deadline.
+InactivityDays=7
+# InactivityAlerts: alert when this many days (or fewer) are left. Time is counted in 24-hour days from your last fill; a firm counting
+# calendar days can end sooner, so treat the last alert day as your deadline and trade before it.
+InactivityAlerts=3,2,1
+
+# --- Second alert channel (optional) ---
+# Everything above depends on Telegram. BackupAlertUrl sends only the CRITICAL alerts a second way: the first Risk UNKNOWN,
+# the tightest floor level or below it, the daily loss limit, an account lock or a lock being enforced, an account that is still
+# exposed after an automatic flatten, and 'Telegram alerts are not getting through'. Blank = off.
+# The notifier POSTs a SHORT plain-text message to this URL (which kind of trouble, and the last 3 characters of the account name: no amounts). ntfy.sh works as is (pick a long random topic and subscribe in its phone app):
+#   BackupAlertUrl=https://ntfy.sh/your-long-random-topic
+# Treat the URL like a password. Check it with /testbackup.
+# >> MY SETUP: Left blank because the URL is a secret. Recommended: an ntfy topic with a long random name, then send /testbackup. BackupAlertDetail stays minimal.
+BackupAlertUrl=
+# BackupAlertFormat: text = the alert as the request body (ntfy and most push services). json = {"text":...,"content":...,"message":...}
+# (Slack and Discord incoming webhooks, and similar).
+BackupAlertFormat=text
+# BackupAlertDetail: minimal = the short message above (the default: the URL is a third party, often a public service).
+# full = the whole alert as Telegram shows it, with account names and dollar amounts: only for a service you run yourself.
+BackupAlertDetail=minimal
+
+# --- Risk log (for replaying a real session) ---
+# EnableRiskLog: true = write every reading the risk check sees to DirectTelegramNotifier-risk.csv (about 7 MB a day per account while the
+# market moves; capped at 50 MB, then it rolls to .old). A session recorded here can be replayed through the risk logic: see docs/TESTING.md.
+EnableRiskLog=true
+
+# --- Machine health (the NinjaTrader process) ---
+# CpuAlertPercent / CpuAlertSeconds: alert when NinjaTrader's CPU stays at or above this level this long. 0 = off.
+CpuAlertPercent=90
+CpuAlertSeconds=180
+# MemoryAlertMB: alert when NinjaTrader uses more memory than this. 0 = off.
+MemoryAlertMB=0
+# DiskAlertMB: alert when the drive holding the config folder has less free space than this. 0 = off.
+DiskAlertMB=2000
+
+# --- Convenience ---
+# FlattenConfirm: true = /flatten and /lock first show Confirm / Cancel buttons (expire after 30 s). false = act immediately.
+FlattenConfirm=false
+# FlattenHoldSeconds: after /flatten, anything that opens on those accounts in this many seconds is closed again
+# (catches a copier or strategy putting the position back, or flipping a follower). 0 = off.
+FlattenHoldSeconds=30
+# FillGroupMs: fills of the same instrument and side within this many milliseconds become one message (500-10000).
+FillGroupMs=2000
+# SilentRoutineAlerts: true = fills, reconnects, in-sync notices, reports and command replies arrive without a notification sound; problems still ring.
+# >> MY SETUP: Three accounts mean many fill messages. Routine ones arrive silently so a risk alert is the only thing that rings.
+SilentRoutineAlerts=true
+# EnableFillCsv: write every fill (and leader vs follower comparison) to DirectTelegramNotifier-fills.csv in this folder.
+EnableFillCsv=true

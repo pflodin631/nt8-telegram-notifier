@@ -24,3 +24,5 @@ DirectTelegramNotifier.floors
 DirectTelegramNotifier.state
 DirectTelegramNotifier.state.tmp
 *.exe
+DirectTelegramNotifier-risk.csv
+DirectTelegramNotifier-risk.csv.old

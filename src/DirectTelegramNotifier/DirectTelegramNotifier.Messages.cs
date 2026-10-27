@@ -226,6 +226,8 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (waitingTotal > 0)
                 sb.Append(" (").Append(Num(priorityWaiting)).Append(" priority, oldest ").Append(FormatDuration(TimeSpan.FromSeconds(OldestQueuedSeconds()))).Append(")");
             sb.Append("\n");
+            if (lastFatalSendUtc > lastSendOkUtc)
+                sb.Append("  ").Append(EmWarn).Append(" Telegram refuses sends: ").Append(Html(lastFatalSendReason)).Append("\n");
             if (DateTime.UtcNow < rateLimitedUntilUtc)
                 sb.Append("  ").Append(EmWarn).Append(" Telegram rate limit for ").Append(FormatDuration(rateLimitedUntilUtc - DateTime.UtcNow)).Append("\n");
             if (!string.IsNullOrEmpty(cfgHeartbeatUrl))
@@ -240,6 +242,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 feedCount = feeds.Values.Count(x => x.Subscribed);
 
             sb.Append("<b>Monitoring</b>\n");
+            lock (dataCheckLock)
+            {
+                foreach (KeyValuePair<string, string> kv in dataCheckPath)
+                    sb.Append("  Risk data check ").Append(Html(kv.Key)).Append(": ").Append(Html(kv.Value)).Append("\n");
+            }
             sb.Append("  Accounts ").Append(Num(SnapshotTrackedAccounts().Count)).Append(Sep)
               .Append("strategies running ").Append(Num(running)).Append(Sep)
               .Append("data feeds ").Append(Num(feedCount)).Append("\n");
@@ -356,9 +363,19 @@ namespace NinjaTrader.NinjaScript.AddOns
             EnqueueSample(MsgDailyLoss(leader, 760.00, 1000.00, 75) + tag, true);
             EnqueueSample(MsgDailyLoss(leader, 1012.50, 1000.00, 100) + tag, true);
             EnqueueSample(MsgDailyLossRecovered(leader, 310.00, 1000.00) + tag, false);
-            EnqueueSample(MsgRiskUnknown(leader, "market data for MNQ DEC26 is stale") + tag, true);
+            EnqueueSample(MsgRiskUnknown(leader, "market data for MNQ DEC26 is stale", TimeSpan.Zero, 0) + tag, true);
+            EnqueueSample(MsgRiskUnknown(leader, "this account's data connection is down", TimeSpan.FromSeconds(120), 180) + tag, true);
             EnqueueSample(MsgRiskKnown(leader) + tag, false);
             EnqueueSample(MsgFloorTrailed(leader, 48000.00, 48296.10, 50296.10) + tag, false);
+            EnqueueSample(MsgHighWaterStarted(leader, 50000.00, 50800.00, true) + tag, true);
+            EnqueueSample(MsgClosingUnknown(leader, 50300.00, 50820.00) + tag, true);
+            EnqueueSample(MsgConsistency(leader, 340.00, 428.57, 75, 30) + tag, true);
+            EnqueueSample(MsgConsistency(leader, 431.00, 428.57, 100, 30) + tag, true);
+            EnqueueSample(MsgInactivity(leader, 2.0, 7, TimeSpan.FromDays(5), 2, false) + tag, true);
+            EnqueueSample(MsgInactivity(leader, -0.1, 7, TimeSpan.FromDays(7.1), 0, true) + tag, true);
+            EnqueueSample(MsgInactivityReset(leader, 7) + tag, false);
+            EnqueueSample(MsgFlatConfirmed(leader, "automatic flatten", 1.5) + tag, false);
+            EnqueueSample(MsgStillExposed(leader, "automatic flatten", 15.0, "<b>" + Html(leader) + "</b>\nLong 3 \u00D7 MNQ DEC26\n") + tag, true);
             EnqueueSample(MsgConfigWarning(new List<string> { "Unrecognized setting RiskAutoFlaten (did you mean RiskAutoFlatten?)" }) + tag, true);
             EnqueueSample(MsgCpuHigh(94.0, TimeSpan.FromSeconds(195)) + tag, true);
             EnqueueSample(MsgDiskLow("C:", 1480) + tag, true);
@@ -442,17 +459,51 @@ namespace NinjaTrader.NinjaScript.AddOns
             return EmUnlock + " <b>UNLOCKED</b>\n" + Html(accounts) + Sep + Html(why);
         }
 
-        private static string MsgRiskUnknown(string account, string why)
+        private static string MsgRiskUnknown(string account, string why, TimeSpan duration, int flattenAfterSec)
         {
-            return EmWarn + " <b>RISK UNKNOWN</b>\n"
+            return EmWarn + " <b>RISK UNKNOWN</b>" + (duration > TimeSpan.Zero ? Sep + "still " + FormatDuration(duration) : string.Empty) + "\n"
                 + Html(account) + " holds a position, but " + Html(why) + ".\n"
-                + "Net liquidation may be frozen, so floor and daily-loss checks (and auto-flatten) are paused for this account.\n"
+                + "Net liquidation may be frozen, so floor, daily-loss and consistency checks are paused for this account"
+                + (flattenAfterSec > 0 ? ", and it is flattened and locked if this lasts " + Num(flattenAfterSec) + "s" : string.Empty) + ".\n"
                 + "<i>Check the position on your broker's platform.</i>";
         }
 
         private static string MsgRiskKnown(string account)
         {
             return EmOk + " <b>RISK DATA BACK</b>\n" + Html(account) + ": floor and daily-loss checks resumed";
+        }
+
+        private static string MsgConsistency(string account, double today, double cap, int level, double percent)
+        {
+            return (level >= 100 ? EmSiren + " <b>CONSISTENCY CAP REACHED</b>" : (level >= 90 ? EmSiren : EmWarn) + " <b>CONSISTENCY " + Num(level) + "%</b>") + "\n"
+                + Html(account) + Sep + "today " + Money(today) + " of " + N2(cap) + " allowed\n"
+                + "<i>Any more profit today makes it more than " + percent.ToString("0.#", CultureInfo.InvariantCulture) + "% of your total profit. Check your firm's rule: it may measure differently.</i>";
+        }
+
+        private static string MsgConsistencyBack(string account, double today, double cap)
+        {
+            return EmOk + " <b>CONSISTENCY BACK UNDER ALERT LEVELS</b>\n" + Html(account) + Sep + "today " + Money(today) + " of " + N2(cap) + " allowed";
+        }
+
+        private static string MsgClosingUnknown(string account, double lastSeen, double now)
+        {
+            return EmWarn + " <b>CLOSING BALANCE UNCERTAIN</b>\n"
+                + Html(account) + ": the session ended while the notifier could not see it, and the account has changed since (last seen "
+                + (double.IsNaN(lastSeen) ? "n/a" : N2(lastSeen)) + ", now " + (double.IsNaN(now) ? "n/a" : N2(now)) + ").\n"
+                + "The trailing high-water mark and best day were NOT updated.\n"
+                + "<i>Compare with your firm's dashboard. /risk seed " + Html(account) + " &lt;highest closing balance&gt; fixes the high-water mark.</i>";
+        }
+
+        private static string MsgHighWaterStarted(string account, double highWater, double current, bool fromStarting)
+        {
+            if (fromStarting)
+                return EmWarn + " <b>HIGH-WATER STARTED AT STARTING BALANCE</b>\n"
+                    + Html(account) + Sep + N2(highWater) + ", but the account is at " + N2(current) + ".\n"
+                    + "If it has already banked profit, the trailing floor is too LOW.\n"
+                    + "<i>Send /risk seed " + Html(account) + " &lt;highest closing balance&gt; to set it from your firm's figures.</i>";
+            return EmInfo + " <b>HIGH-WATER STARTED</b>\n"
+                + Html(account) + Sep + "started at the current " + N2(current) + " (no StartingBalance is set).\n"
+                + "<i>If the account's real high-water mark is higher, send /risk seed " + Html(account) + " &lt;value&gt;.</i>";
         }
 
         private static string MsgDailyLoss(string account, double loss, double limit, int pct)
@@ -626,11 +677,15 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private string Redact(string s)
         {
-            if (string.IsNullOrEmpty(s) || string.IsNullOrEmpty(resolvedToken))
+            if (string.IsNullOrEmpty(s))
                 return s;
-            string redacted = s.Replace(resolvedToken, "***TOKEN***");
+            string redacted = s;
+            if (!string.IsNullOrEmpty(resolvedToken))
+                redacted = redacted.Replace(resolvedToken, "***TOKEN***");
             if (!string.IsNullOrEmpty(cfgHeartbeatUrl))
                 redacted = redacted.Replace(cfgHeartbeatUrl, "***HEARTBEAT-URL***");
+            if (!string.IsNullOrEmpty(cfgBackupUrl))
+                redacted = redacted.Replace(cfgBackupUrl, "***BACKUP-URL***");
             return redacted;
         }
 

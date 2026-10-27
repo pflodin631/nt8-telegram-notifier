@@ -316,6 +316,18 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Null when alerts are getting through; otherwise why not.
         private string DeliveryProblem(DateTime now)
         {
+            if (lastFatalSendUtc > lastSendOkUtc)
+            {
+                // Polling and getMe can keep working while every send is refused. Only a send proves delivery, so
+                // while refused, try a silent test now and then: once Telegram accepts it, the heartbeat resumes.
+                if ((now - lastDeliveryTestUtc).TotalSeconds >= DeliveryTestSec)
+                {
+                    lastDeliveryTestUtc = now;
+                    Enqueue(EmInfo + " <b>Delivery check</b>\nTelegram accepted this message: alerts are reaching you again.", true, null, true, true);
+                }
+                return "Telegram refuses sends (" + lastFatalSendReason + ")";
+            }
+
             DateTime lastOk = lastSendOkUtc;
             if (lastPollOkUtc > lastOk) lastOk = lastPollOkUtc;
             if (lastProbeOkUtc > lastOk) lastOk = lastProbeOkUtc;

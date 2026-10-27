@@ -125,6 +125,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 int seeded = 0;
                 foreach (CbiExecution ex in list.Where(x => x != null).OrderBy(x => x.Time))
                 {
+                    NoteActivity(a.Name, ExecutionUtc(ex));          // the inactivity clock looks back further than today
                     if (ex.Time < sessionStartNt)
                         continue;
                     if (RecordExecution(ex))
@@ -206,6 +207,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 seenExecutionIds[id] = DateTime.UtcNow;
                 opened = ApplyExecutionLocked(ex);
             }
+            NoteActivity(AccountNameOf(ex), ExecutionUtc(ex));
             return true;
         }
 
@@ -674,6 +676,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             StringBuilder sb = new StringBuilder();
             sb.Append(EmChart).Append(" <b>STATUS</b>").Append(Sep).Append(TimeText(NtNow())).Append("\n\n");
 
+            sb.Append(AutoFlattenLine()).Append("\n\n");
             sb.Append("<b>Connections</b>\n").Append(BuildConnectionsBlock()).Append("\n");
 
             string leaderName = ResolveLeaderName();

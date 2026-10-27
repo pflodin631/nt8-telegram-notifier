@@ -135,6 +135,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                  + "#   intraday = trails the highest live net liquidation, including open profit, capped at FloorLock\r\n"
                  + "# A /floor setting always overrides the mode until /floor clear.\r\n"
                  + "DrawdownMode=manual\r\n"
+                 + "# HighWaterBasis (per account): what a trailing high-water mark is measured on.\r\n"
+                 + "#   balance = closing balance without open profit or loss (net liquidation minus open P&L). Right for end-of-day trailing.\r\n"
+                 + "#   netliq  = net liquidation including open profit. Intraday trailing always uses net liquidation.\r\n"
+                 + "# Firms differ: check which one yours uses. Compare /risk with your firm's dashboard after the first session.\r\n"
+                 + "HighWaterBasis=balance\r\n"
                  + "# RiskFloor (per account): the floor for manual mode, in net liquidation dollars. Blank = none.\r\n"
                  + "RiskFloor=\r\n"
                  + "# StartingBalance (per account): account size. Needed for static; trailing modes start from it (else from current net liquidation).\r\n"
@@ -154,6 +159,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                  + "# FloorJumpConfirm: /floor asks for a button press when it moves a floor by more than this, or puts it inside your alert levels. 0 = only the latter.\r\n"
                  + "FloorJumpConfirm=1000\r\n"
                  + "#\r\n"
+                 + "# UnknownFlattenSeconds: while you hold a position and the risk numbers can't be trusted (data connection down, feed stale,\r\n"
+                 + "# net liquidation unreadable), flatten and lock the account after this many seconds. 0 = never: only alert (every minute).\r\n"
+                 + "# Orders do not need market data, so a flatten still works. A short data blip would cost you the position, so think before using it.\r\n"
+                 + "UnknownFlattenSeconds=0\r\n"
+                 + "# LockGroup: true = when one tracked account is locked, lock them all. Stops a copier from re-opening trades on a locked follower\r\n"
+                 + "# (each re-entry is closed at a small loss), but one account's breach then halts every account.\r\n"
+                 + "LockGroup=false\r\n"
+                 + "#\r\n"
                  + "# DailyLossLimit (per account): maximum loss per session, measured from net liquidation at the session start (EodReportTime).\r\n"
                  + "# Dollars (1000) or percent of the session-start value (2%). Blank = off.\r\n"
                  + "DailyLossLimit=\r\n"
@@ -161,6 +174,49 @@ namespace NinjaTrader.NinjaScript.AddOns
                  + "DailyLossAlerts=50,75,90\r\n"
                  + "# DailyLossAutoFlatten: true = flatten and lock an account that reaches its daily loss limit.\r\n"
                  + "DailyLossAutoFlatten=false\r\n"
+                 + "#\r\n"
+                 + "# --- Consistency rule (best day as a share of total profit) ---\r\n"
+                 + "# ConsistencyPercent (per account): your firm's limit, e.g. 30, 40 or 50. Blank or 0 = off. Needs StartingBalance.\r\n"
+                 + "# Firms differ (and change their rules): enter the percentage from YOUR account's rules.\r\n"
+                 + "# The notifier shows how much today's profit can reach before today is more than this share of your total profit.\r\n"
+                 + "ConsistencyPercent=\r\n"
+                 + "# ConsistencyProfitTarget (per account): LEAVE BLANK unless your firm measures against the larger of total profit and the profit target.\r\n"
+                 + "# Setting it raises the allowed daily profit to at least percent x target, which overstates your room if your firm does not do that.\r\n"
+                 + "ConsistencyProfitTarget=\r\n"
+                 + "# ConsistencyAlerts: percentages of today's allowed profit that alert.\r\n"
+                 + "ConsistencyAlerts=75,90\r\n"
+                 + "# ConsistencyAutoFlatten: true = flatten and lock the account when today's profit reaches the cap (stops the day from getting too big).\r\n"
+                 + "ConsistencyAutoFlatten=false\r\n"
+                 + "\r\n"
+                 + "# --- Inactivity rule ---\r\n"
+                 + "# InactivityDays (per account): your firm closes an account that has not traded for this many days. Blank or 0 = off.\r\n"
+                 + "# Any fill counts as a trade. Check which accounts your firm applies this to (some only to funded accounts).\r\n"
+                 + "# The notifier warns you; it never places a trade. Tell your firm in advance about planned breaks.\r\n"
+                 + "# Example for one account only:  InactivityDays:Acct001=7\r\n"
+                 + "InactivityDays=\r\n"
+                 + "# InactivityAlerts: alert when this many days (or fewer) are left. Time is counted in 24-hour days from your last fill; a firm counting\r\n"
+                 + "# calendar days can end sooner, so treat the last alert day as your deadline and trade before it.\r\n"
+                 + "InactivityAlerts=3,2,1\r\n"
+                 + "\r\n"
+                 + "# --- Second alert channel (optional) ---\r\n"
+                 + "# Everything above depends on Telegram. BackupAlertUrl sends only the CRITICAL alerts a second way: the first Risk UNKNOWN,\r\n"
+                 + "# the tightest floor level or below it, the daily loss limit, an account lock or a lock being enforced, an account that is still\r\n"
+                 + "# exposed after an automatic flatten, and 'Telegram alerts are not getting through'. Blank = off.\r\n"
+                 + "# The notifier POSTs a SHORT plain-text message to this URL (which kind of trouble, and the last 3 characters of the account name: no amounts). ntfy.sh works as is (pick a long random topic and subscribe in its phone app):\r\n"
+                 + "#   BackupAlertUrl=https://ntfy.sh/your-long-random-topic\r\n"
+                 + "# Treat the URL like a password. Check it with /testbackup.\r\n"
+                 + "BackupAlertUrl=\r\n"
+                 + "# BackupAlertFormat: text = the alert as the request body (ntfy and most push services). json = {\"text\":...,\"content\":...,\"message\":...}\r\n"
+                 + "# (Slack and Discord incoming webhooks, and similar).\r\n"
+                 + "BackupAlertFormat=text\r\n"
+                 + "# BackupAlertDetail: minimal = the short message above (the default: the URL is a third party, often a public service).\r\n"
+                 + "# full = the whole alert as Telegram shows it, with account names and dollar amounts: only for a service you run yourself.\r\n"
+                 + "BackupAlertDetail=minimal\r\n"
+                 + "\r\n"
+                 + "# --- Risk log (for replaying a real session) ---\r\n"
+                 + "# EnableRiskLog: true = write every reading the risk check sees to DirectTelegramNotifier-risk.csv (about 7 MB a day per account while the\r\n"
+                 + "# market moves; capped at 50 MB, then it rolls to .old). A session recorded here can be replayed through the risk logic: see docs/TESTING.md.\r\n"
+                 + "EnableRiskLog=true\r\n"
                  + "\r\n"
                  + "# --- Machine health (the NinjaTrader process) ---\r\n"
                  + "# CpuAlertPercent / CpuAlertSeconds: alert when NinjaTrader's CPU stays at or above this level this long. 0 = off.\r\n"
@@ -267,6 +323,19 @@ namespace NinjaTrader.NinjaScript.AddOns
             cfgRiskConfirmSec             = Math.Max(1, Math.Min(30, GetInt(kv, "RiskConfirmSeconds", 2)));
             cfgFlattenHoldSec             = Math.Max(0, Math.Min(600, GetInt(kv, "FlattenHoldSeconds", 30)));
             cfgFloorJumpConfirm           = Math.Max(0.0, GetDouble(kv, "FloorJumpConfirm", 1000.0));
+            cfgHighWaterBasis             = GetString(kv, "HighWaterBasis", "balance");
+            cfgUnknownFlattenSec          = Math.Max(0, Math.Min(3600, GetInt(kv, "UnknownFlattenSeconds", 0)));
+            cfgLockGroup                  = GetBool(kv, "LockGroup", false);
+            cfgConsistencyPercent         = ParseOptionalDouble(GetString(kv, "ConsistencyPercent", string.Empty));
+            cfgConsistencyTarget          = ParseOptionalDouble(GetString(kv, "ConsistencyProfitTarget", string.Empty));
+            consistencyAlerts             = ParseDollarList(GetString(kv, "ConsistencyAlerts", "75,90"));
+            cfgConsistencyAutoFlatten     = GetBool(kv, "ConsistencyAutoFlatten", false);
+            cfgEnableRiskLog              = GetBool(kv, "EnableRiskLog", true);
+            cfgBackupUrl                  = GetString(kv, "BackupAlertUrl", string.Empty).Trim();
+            cfgBackupFormat               = GetString(kv, "BackupAlertFormat", "text").Trim().ToLowerInvariant();
+            cfgBackupDetail               = GetString(kv, "BackupAlertDetail", "minimal").Trim().ToLowerInvariant();
+            cfgInactivityDays             = ParseOptionalDouble(GetString(kv, "InactivityDays", string.Empty));
+            inactivityAlerts              = ParseDollarList(GetString(kv, "InactivityAlerts", "3,2,1"));
 
             List<string> warnings = new List<string>();
             foreach (string unknown in Dtn.FindUnknownKeys(kv.Keys))
@@ -299,6 +368,43 @@ namespace NinjaTrader.NinjaScript.AddOns
                         warnings.Add("DrawdownMode:" + pair.Key.Substring("drawdownmode|".Length) + " '" + pair.Value + "' is not recognized; using manual");
                 }
             }
+            if (Dtn.NormalizeBasis(cfgHighWaterBasis) == null)
+                warnings.Add("HighWaterBasis '" + cfgHighWaterBasis + "' is not balance or netliq; using balance");
+            lock (riskLock)
+            {
+                foreach (KeyValuePair<string, string> pair in accountSettings)
+                {
+                    if (pair.Key.StartsWith("highwaterbasis|", StringComparison.Ordinal) && Dtn.NormalizeBasis(pair.Value) == null)
+                        warnings.Add("HighWaterBasis:" + pair.Key.Substring("highwaterbasis|".Length) + " '" + pair.Value + "' is not balance or netliq; using balance");
+                    if (pair.Key.StartsWith("consistencypercent|", StringComparison.Ordinal))
+                    {
+                        double cp = ParseOptionalDouble(pair.Value);
+                        if (!double.IsNaN(cp) && (cp < 0 || cp >= 100))
+                            warnings.Add("ConsistencyPercent:" + pair.Key.Substring("consistencypercent|".Length) + " must be between 0 and 100 (0 = off)");
+                    }
+                }
+            }
+            if (!double.IsNaN(cfgConsistencyPercent) && (cfgConsistencyPercent < 0 || cfgConsistencyPercent >= 100))
+                warnings.Add("ConsistencyPercent must be between 0 and 100 (0 = off)");
+            if (cfgBackupUrl.Length > 0 && !(cfgBackupUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase) || cfgBackupUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase)))
+            {
+                warnings.Add("BackupAlertUrl must start with https:// (or http://); the backup channel is off");
+                cfgBackupUrl = string.Empty;
+            }
+            else if (cfgBackupUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+                warnings.Add("BackupAlertUrl uses http://: the alert text and any secret in the URL travel unencrypted");
+            if (cfgBackupFormat != "text" && cfgBackupFormat != "json")
+            {
+                warnings.Add("BackupAlertFormat '" + cfgBackupFormat + "' is not text or json; using text");
+                cfgBackupFormat = "text";
+            }
+            if (cfgBackupDetail != "minimal" && cfgBackupDetail != "full")
+            {
+                warnings.Add("BackupAlertDetail '" + cfgBackupDetail + "' is not minimal or full; using minimal");
+                cfgBackupDetail = "minimal";
+            }
+            if (!double.IsNaN(cfgInactivityDays) && cfgInactivityDays < 0)
+                warnings.Add("InactivityDays must be 0 or more (0 = off)");
             configWarnings = warnings;
             foreach (string w in warnings)
                 WriteOutput("Config warning: " + w);

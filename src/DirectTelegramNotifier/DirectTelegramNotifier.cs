@@ -32,10 +32,11 @@ using Dtn = NinjaTrader.NinjaScript.AddOns.DirectTelegramNotifierCore;
 //  Alerts:    fills, connection loss/restore (orders and data), UI freeze, rejected orders,
 //             order-rate spikes, strategy disabled, stale market data, trade-copier mismatch
 //             (leader vs followers), unprotected positions, orphan and stuck orders, position limit,
-//             drawdown floor (manual, static, end-of-day or intraday trailing), daily loss limit, risk UNKNOWN
+//             drawdown floor (manual, static, end-of-day or intraday trailing), daily loss limit, consistency-rule cap,
+//             inactivity clock, risk UNKNOWN
 //             while data is stale, NinjaTrader CPU/memory/disk, restart/crash detection, end-of-day summary.
 //             Every alert is also appended to Documents\NinjaTrader 8\DirectTelegramNotifier.log.
-//  Commands:  /status  /flatten  /cancel  /lock  /unlock  /risk  /floor  /leader  /copy  /eod  /diag  /simulate  /version  /help
+//  Commands:  /status  /flatten  /cancel  /lock  /unlock  /risk  /floor  /activity  /leader  /selftest  /testbackup  /copy  /eod  /diag  /simulate  /version  /help
 //             (accepted only from AuthorizedChatID)
 //  Safety:    optional auto-flatten that LOCKS the account (re-entries are closed again until /unlock or
 //             the session ends); a short hold after /flatten that closes copier or strategy re-entries.
@@ -54,7 +55,7 @@ using Dtn = NinjaTrader.NinjaScript.AddOns.DirectTelegramNotifierCore;
 //     ignored, so a stale /flatten never runs after a restart or reboot.
 //   * /flatten covers the tracked account(s) only, unless UseGlobalFlattenEverything=true.
 //
-//  Version 0.3.0, MIT License. Not affiliated with or endorsed by NinjaTrader or Telegram.
+//  Version 0.5.1, MIT License. Not affiliated with or endorsed by NinjaTrader or Telegram.
 //  Provided as is, without warranty. Automated trading and remote order control carry risk.
 //
 //  Written in C# 5 syntax so it compiles on any NinjaScript compiler version.
@@ -77,7 +78,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const int    SendRetryWindowMin   = 30;
         private const int    ShutdownDrainSec     = 4;
         private const int    MaxTextLength        = 4000;
-        private const int    FlattenVerifyDelayMs = 2500;
+        private const int    FlattenFirstCheckMs  = 1000;         // first look at whether a flatten worked
+        private const int    FlattenPollMs        = 500;          // then every half second, until flat or the budget runs out
+        private const long   RiskLogMaxBytes      = 50L * 1024 * 1024;
+        private const int    RiskLogKeepaliveSec  = 30;           // a row at least this often, so a replay never holds a reading for long
+        private const int    BackupDedupeSec      = 60;
         private const int    FlapThreshold        = 4;
         private const int    FlapWindowSec        = 300;
         private const int    FlapMuteSec          = 300;
@@ -97,9 +102,10 @@ namespace NinjaTrader.NinjaScript.AddOns
         private const int    RoutineMergeAt       = 4;            // this many routine messages waiting -> send them as one
         private const int    MergeMaxChars        = 3500;
         private const int    DeliveryStaleSec     = 180;          // no successful Telegram call for this long -> hold the external heartbeat
+        private const int    DeliveryTestSec      = 300;          // while Telegram rejects sends, try a silent test message this often
         private const string DefaultStuckStates   = "Submitted,ChangePending,ChangeSubmitted,CancelPending,CancelSubmitted";
         private const string StateFileName        = "DirectTelegramNotifier.state";
-        private const string AddOnVersion        = "0.3.0";
+        private const string AddOnVersion        = "0.5.1";
         private const string HeartbeatFileName    = "DirectTelegramNotifier.heartbeat";
         private const string Sep                  = " \u00B7 ";
 
@@ -146,18 +152,12 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // Per-account risk bookkeeping. Guarded by riskLock; saved to the state file so restarts keep it.
-        private sealed class RiskState
+        private sealed class PendingConfirm
         {
-            public double HighWater = double.NaN;        // trailing modes: highest closing (eod) or live (intraday) net liquidation
-            public double TrailFloor = double.NaN;       // trailing modes: computed floor, never moves down
-            public double SessionStart = double.NaN;     // net liquidation when the session began: the daily-loss baseline
-            public string Session = string.Empty;        // which session SessionStart belongs to
-            public bool   BaselineMidSession;            // tracking began after the session had started
-            public double LastNetLiq = double.NaN;
-            public int    DailyLevel;                    // highest daily-loss percentage already alerted
-            public DateTime FloorBreachSince = DateTime.MinValue;
-            public DateTime DailyBreachSince = DateTime.MinValue;
-            public bool   Unknown;                       // holding a position while net liquidation can't be trusted
+            public string Kind;
+            public string Filter;
+            public double Value;
+            public DateTime ExpiresUtc;
         }
 
         // A locked account is kept flat: anything that opens on it is closed again.
@@ -354,6 +354,19 @@ namespace NinjaTrader.NinjaScript.AddOns
         private int    cfgFlattenHoldSec = 30;
         private double cfgFloorJumpConfirm = 1000.0;
         private List<string> configWarnings = new List<string>();
+        private int    flattenCheckMaxMs = 15000;     // how long /flatten keeps checking that positions are really gone
+        private int    autoFlattenWatchMs = 15000;    // the same for an automatic flatten or /lock; 0 = no follow-up
+        private bool   cfgEnableRiskLog = true;
+        private string cfgBackupUrl = string.Empty;
+        private string cfgBackupFormat = "text";
+        private string cfgBackupDetail = "minimal";
+        private string cfgHighWaterBasis = "balance";
+        private int    cfgUnknownFlattenSec = 0;
+        private bool   cfgLockGroup = false;
+        private double cfgConsistencyPercent = double.NaN;
+        private double cfgConsistencyTarget = double.NaN;
+        private List<double> consistencyAlerts = new List<double>();
+        private bool   cfgConsistencyAutoFlatten = false;
         private bool   cfgEnableOrderRejectAlerts = true;
         private int    cfgRunawayMaxOrders = 30;
         private int    cfgRunawayWindowSec = 60;
@@ -387,6 +400,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         private DateTime lastProbeOkUtc = DateTime.MinValue;
         private int probeBusy;
         private string heartbeatHoldReason = string.Empty;
+        private DateTime lastFatalSendUtc = DateTime.MinValue;     // a send Telegram refused for good (blocked, bad chat, bad token)
+        private string lastFatalSendReason = string.Empty;
+        private DateTime lastDeliveryTestUtc = DateTime.MinValue;
         private readonly SemaphoreSlim sendSignal = new SemaphoreSlim(0);
 
         private long updateOffset;
@@ -464,8 +480,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         private readonly object riskLock = new object();
         private readonly Dictionary<string, string> accountSettings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); // "key|Account" -> value, from Key:Account= lines
         private readonly Dictionary<string, double> floorOverrides = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);  // from /floor ("*" = all)
-        private readonly Dictionary<string, double> riskLevel = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, RiskState> riskStates = new Dictionary<string, RiskState>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DtnRiskState> riskStates = new Dictionary<string, DtnRiskState>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, AccountLock> accountLocks = new Dictionary<string, AccountLock>(StringComparer.OrdinalIgnoreCase);
         private List<double> riskBuffers = new List<double>();
         private bool riskReadProblemReported;
@@ -485,13 +500,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         private long lastDiskFreeMb = -1;
         private DateTime lastDiskCheckUtc = DateTime.MinValue;
         private DateTime lastDiskAlertUtc = DateTime.MinValue;
-        private string confirmFilter = string.Empty;
-
+        // Several confirmations can be pending at once: a /floor prompt no longer cancels a /flatten prompt.
         private readonly object confirmLock = new object();
-        private string confirmToken = string.Empty;
-        private DateTime confirmExpiresUtc = DateTime.MinValue;
-        private string confirmKind = string.Empty;             // "flatten", "lock" or "floor"
-        private double confirmValue = double.NaN;
+        private readonly Dictionary<string, PendingConfirm> pendingConfirms = new Dictionary<string, PendingConfirm>();
 
         private readonly object linesLock = new object();
         private readonly Queue<string> recentLines = new Queue<string>();
@@ -735,6 +746,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 CheckCopyMismatch();
                 PruneTrackingSets();
                 CheckExposure();
+                CheckInactivity(DateTime.UtcNow);
+                CheckReadinessOnce();
+                CheckDeliveryBackup(DateTime.UtcNow);
                 CheckMachineHealth();
                 CheckEndOfDay();
             }

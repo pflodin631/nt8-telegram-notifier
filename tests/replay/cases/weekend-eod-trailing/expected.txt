@@ -1,0 +1,4 @@
+2026-10-30 20:00:00 F1 HighWaterStarted loud A=50,000.00 B=50,500.00 C=0.00 D=0.00 N=0 flag
+2026-10-30 21:01:00 F1 FloorTrailed quiet A=48,000.00 B=49,000.00 C=51,000.00 D=0.00 N=0
+2026-11-02 21:01:00 F1 FloorTrailed quiet A=49,000.00 B=49,200.00 C=51,200.00 D=0.00 N=0
+END F1 session=2026-11-03 highWater=51,200.00 trailFloor=49,200.00 bestDay=500.00 unknown=no

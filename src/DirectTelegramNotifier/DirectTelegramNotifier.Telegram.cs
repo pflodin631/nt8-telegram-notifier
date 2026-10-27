@@ -158,6 +158,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 bool firstTime;
                 lock (warnedUnauthorizedIds)
                     firstTime = warnedUnauthorizedIds.Add(fromId);
+                LogAlert("AUDIT ignored a message from another Telegram user (id " + fromId.ToString(CultureInfo.InvariantCulture) + ")");
                 if (firstTime)
                     WriteOutput("Ignored message from unauthorized Telegram user id " + fromId.ToString(CultureInfo.InvariantCulture)
                         + ". (If that is you, put this number in AuthorizedChatID.)");
@@ -179,6 +180,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             string argument = ParseArgument(messageText);
 
             WriteOutput("Remote command received: " + command);
+            LogAlert("AUDIT command " + command + (argument.Length > 0 ? " " + argument : string.Empty));
 
             switch (command)
             {
@@ -201,7 +203,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                         EnqueueReply(ExecuteLockCommand(argument));
                     break;
                 case "/unlock":
-                    EnqueueReply(ExecuteUnlockCommand(argument));
+                    if (cfgFlattenConfirm)
+                        RequestActionConfirmation("unlock", argument);
+                    else
+                        EnqueueReply(ExecuteUnlockCommand(argument));
+                    break;
+                case "/selftest":
+                    EnqueueReply(BuildSelfTestText(AssessReadiness()));
+                    break;
+                case "/testbackup":
+                    RunInBackground(async () => EnqueueReply(await TestBackupAsync()), "Backup test");
                     break;
                 case "/floor":
                     {
@@ -211,7 +222,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                     }
                     break;
                 case "/risk":
-                    EnqueueReply(HandleRiskCommand(argument));
+                    {
+                        string riskReply = HandleRiskCommand(argument);
+                        if (riskReply != null)
+                            EnqueueReply(riskReply);
+                    }
+                    break;
+                case "/activity":
+                    EnqueueReply(HandleActivityCommand(argument));
                     break;
                 case "/leader":
                     EnqueueReply(HandleLeaderCommand(argument));
@@ -311,19 +329,36 @@ namespace NinjaTrader.NinjaScript.AddOns
                 sb.Append(EmWarn).Append(" Error: ").Append(Html(ex.Message)).Append("\n");
             }
 
-            await Task.Delay(FlattenVerifyDelayMs);
-
+            // Look again until the positions are really gone, instead of judging after a fixed wait.
+            DateTime verifyStart = DateTime.UtcNow;
+            await Task.Delay(Math.Min(FlattenFirstCheckMs, flattenCheckMaxMs));
             bool allFlat;
             string check = BuildPostFlattenCheck(targets, out allFlat);
-            sb.Append("\n").Append(allFlat ? EmOk + " <b>Flat</b>" : EmWarn + " <b>Exposure remains</b>")
-              .Append(" after ").Append((FlattenVerifyDelayMs / 1000.0).ToString("0.0", CultureInfo.InvariantCulture)).Append("s\n")
+            while (!allFlat && (DateTime.UtcNow - verifyStart).TotalMilliseconds < flattenCheckMaxMs)
+            {
+                await Task.Delay(FlattenPollMs);
+                check = BuildPostFlattenCheck(targets, out allFlat);
+            }
+            double tookSec = (DateTime.UtcNow - verifyStart).TotalSeconds;
+            sb.Append("\n").Append(allFlat ? EmOk + " <b>Flat</b>" : EmSiren + " <b>STILL EXPOSED</b>")
+              .Append(" after ").Append(tookSec.ToString("0.0", CultureInfo.InvariantCulture)).Append("s\n")
               .Append(check);
+            if (!allFlat)
+                sb.Append("<i>Check your broker's platform and close it by hand if needed. A flatten that is still working is not sent again, to avoid reversing the position.</i>\n");
             if (cfgFlattenHoldSec > 0)
                 sb.Append("Hold: anything new on ").Append(held.Count == 1 ? "this account" : "these accounts").Append(" is closed again for ")
                   .Append(Num(cfgFlattenHoldSec)).Append("s.\n");
             sb.Append("<i>Strategies and copiers are not disabled. To keep an account flat, use /lock.</i>");
 
-            EnqueueText(sb.ToString());
+            if (allFlat)
+            {
+                EnqueueText(sb.ToString());
+            }
+            else
+            {
+                EnqueueCritical(sb.ToString(), StillExposedMinimal(targets, tookSec));
+                RepeatExposureAlerts(targets, "/flatten", verifyStart, false, ExposureRepeatFlattenMinutes);
+            }
         }
 
         // Cancels working orders (no flatten). Uses Account.Cancel through reflection so a NinjaTrader API difference cannot break the compile.
@@ -471,8 +506,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 + "/cancel [account] \u2014 cancel working orders, keep positions\n"
                 + "/lock [account] \u2014 flatten and keep the account flat until /unlock or the session ends\n"
                 + "/unlock [account] \u2014 end a lock\n"
-                + "/risk \u2014 floors, buffers, daily loss and locks (/risk reset [account] restarts a trailing floor)\n"
+                + "/risk \u2014 floors, buffers, daily loss, consistency and locks. /risk seed ACCOUNT 51000 sets a trailing high-water mark; /risk reset [account] restarts it\n"
                 + "/floor [account] [amount] \u2014 set a floor by hand (/floor 48250, /floor 002 48500, /floor clear)\n"
+                + "/selftest \u2014 can it read everything it needs, and is auto-flatten armed for each account\n"
+                + "/testbackup \u2014 send a test through the backup alert channel\n"
+                + "/activity [account days] \u2014 last trade and days left on the inactivity rule (/activity 002 3 = last traded 3 days ago)\n"
                 + "/leader [account] \u2014 show or change the copier leader (/leader clear)\n"
                 + "/copy \u2014 follower fills vs the leader today\n"
                 + "/eod \u2014 preview the end-of-day report\n"
@@ -831,6 +869,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             else if (code == 403)
                 hint = " The bot was blocked or is not allowed to message this chat.";
 
+            // Blocked bot, wrong chat or revoked token: every alert is being thrown away, even though polling may still work.
+            if (Dtn.IsFatalSendError(code, description))
+            {
+                lastFatalSendUtc = DateTime.UtcNow;
+                lastFatalSendReason = "HTTP " + code.ToString(CultureInfo.InvariantCulture) + (hint.Length > 0 ? ":" + hint : string.Empty);
+            }
             WriteOutput("sendMessage rejected (" + code.ToString(CultureInfo.InvariantCulture) + "): " + Truncate(description, 300) + hint);
             return new SendOutcome(SendResult.Permanent, 0);
         }
@@ -901,7 +945,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             string scope = targeted ? Html(targets[0].Name)
                 : (kind == "flatten" && cfgUseGlobalFlattenEverything ? "<b>ALL accounts</b>" : "tracked accounts");
 
-            if (kind == "lock")
+            if (kind == "unlock")
+                RequestConfirmation("unlock", targeted ? filter.Trim() : string.Empty, double.NaN,
+                    EmWarn + " <b>Confirm unlock?</b>\nScope: " + scope + "\nThe account can trade again. A floor or limit that is still breached can lock it again.",
+                    EmUnlock + " Unlock now");
+            else if (kind == "lock")
                 RequestConfirmation("lock", targeted ? filter.Trim() : string.Empty, double.NaN,
                     EmWarn + " <b>Confirm lock?</b>\nScope: " + scope + "\nFlattens, cancels orders, and closes anything new until /unlock or the session ends.",
                     EmLock + " Lock now");
@@ -915,11 +963,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             string token = Guid.NewGuid().ToString("N").Substring(0, 8);
             lock (confirmLock)
             {
-                confirmToken = token;
-                confirmKind = kind;
-                confirmFilter = filter ?? string.Empty;
-                confirmValue = value;
-                confirmExpiresUtc = DateTime.UtcNow.AddSeconds(FlattenConfirmSec);
+                DateTime now = DateTime.UtcNow;
+                foreach (string old in pendingConfirms.Where(kv => kv.Value.ExpiresUtc < now).Select(kv => kv.Key).ToList())
+                    pendingConfirms.Remove(old);
+                pendingConfirms[token] = new PendingConfirm { Kind = kind, Filter = filter ?? string.Empty, Value = value, ExpiresUtc = now.AddSeconds(FlattenConfirmSec) };
             }
 
             string markup = "{\"inline_keyboard\":[[{\"text\":\"" + okLabel + "\",\"callback_data\":\"ok:" + token
@@ -946,32 +993,51 @@ namespace NinjaTrader.NinjaScript.AddOns
             double value = double.NaN;
             lock (confirmLock)
             {
-                if (token.Length > 0 && token == confirmToken)
+                PendingConfirm pending;
+                if (token.Length > 0 && pendingConfirms.TryGetValue(token, out pending))
                 {
-                    valid = DateTime.UtcNow <= confirmExpiresUtc;
-                    kind = confirmKind;
-                    filter = confirmFilter;
-                    value = confirmValue;
-                    confirmToken = string.Empty;                     // single use
+                    pendingConfirms.Remove(token);                   // single use
+                    valid = DateTime.UtcNow <= pending.ExpiresUtc;
+                    kind = pending.Kind;
+                    filter = pending.Filter;
+                    value = pending.Value;
                 }
             }
 
+            if (isOk || isCancel)
+                LogAlert("AUDIT button " + (isOk ? "confirm" : "cancel") + " " + kind + (filter.Length > 0 ? " " + filter : string.Empty) + (valid ? string.Empty : " (expired or already used)"));
             if (isOk && valid)
             {
-                if (kind == "lock")
+                switch (kind)
                 {
-                    await AnswerCallbackAsync(id, "Locking...");
-                    EnqueueReply(ExecuteLockCommand(filter));
-                }
-                else if (kind == "floor")
-                {
-                    await AnswerCallbackAsync(id, "Floor set");
-                    EnqueueReply(ApplyFloor(filter, value));
-                }
-                else
-                {
-                    await AnswerCallbackAsync(id, "Flattening...");
-                    RunInBackground(() => ExecuteFlattenAsync(filter), "Flatten");
+                    case "unlock":
+                        await AnswerCallbackAsync(id, "Unlocking...");
+                        EnqueueReply(ExecuteUnlockCommand(filter));
+                        break;
+                    case "lock":
+                        await AnswerCallbackAsync(id, "Locking...");
+                        EnqueueReply(ExecuteLockCommand(filter));
+                        break;
+                    case "floor":
+                        await AnswerCallbackAsync(id, "Floor set");
+                        EnqueueReply(ApplyFloor(filter, value));
+                        break;
+                    case "riskreset":
+                        await AnswerCallbackAsync(id, "Reset");
+                        EnqueueReply(ApplyRiskReset(filter));
+                        break;
+                    case "riskseed":
+                        await AnswerCallbackAsync(id, "Seeded");
+                        EnqueueReply(ApplySeed(filter, value, false));
+                        break;
+                    case "riskbest":
+                        await AnswerCallbackAsync(id, "Seeded");
+                        EnqueueReply(ApplySeed(filter, value, true));
+                        break;
+                    default:
+                        await AnswerCallbackAsync(id, "Flattening...");
+                        RunInBackground(() => ExecuteFlattenAsync(filter), "Flatten");
+                        break;
                 }
             }
             else if (isCancel && valid)

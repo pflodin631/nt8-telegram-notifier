@@ -1,0 +1,5 @@
+2026-10-30 15:00:10 G1 Unknown loud A=0.00 B=0.00 C=0.00 D=0.00 N=120 this account's data connection is down
+2026-10-30 15:01:10 G1 Unknown loud A=60.00 B=0.00 C=0.00 D=0.00 N=120 this account's data connection is down
+2026-10-30 15:02:10 G1 Unknown loud A=120.00 B=0.00 C=0.00 D=0.00 N=120 this account's data connection is down
+2026-10-30 15:02:10 G1 FIRE risk data unavailable for 120s while holding a position (this account's data connection is down)
+END G1 session=2026-10-27 highWater=NaN trailFloor=NaN bestDay=NaN unknown=yes

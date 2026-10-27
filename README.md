@@ -1,6 +1,6 @@
 # NT8 Direct Telegram Notifier
 
-Telegram alerts, risk enforcement and a small remote-control surface for **NinjaTrader 8**, as an AddOn. It talks straight to the Telegram Bot API over HTTPS: no NinjaTrader Share Services, no relay or server of mine, no extra DLLs. Telegram itself carries your alerts, including account names and dollar amounts. If you opt in, a short alert without amounts also goes to a push service you choose (see [Second alert channel](#second-alert-channel-optional)), and optionally a heartbeat URL. It works for personal accounts and prop-firm accounts alike: you describe your own risk rules in the config, and it has no firm presets.
+Telegram alerts, risk enforcement and a small remote-control surface for **NinjaTrader 8**, as an AddOn. It talks straight to the Telegram Bot API over HTTPS: no NinjaTrader Share Services, no relay or server of mine, no extra DLLs. Telegram itself carries your alerts, including account names and dollar amounts. If you opt in, a short alert without amounts also goes to a push service you choose (see [Second alert channel](#second-alert-channel-optional)), and optionally a heartbeat URL. It works for personal accounts and prop-firm accounts alike: you describe your own risk rules in the config, and it has no firm presets (the example config file below is a worked example, not a preset).
 
 > **Status: beta (v0.5.1).** It can flatten and lock accounts on command and, if you switch it on, automatically. The 0.3 to 0.5 risk features are unit-tested but **not yet verified on Sim**: see [Verified so far](#verified-so-far). Read [Limitations](#limitations) and the [Disclaimer](#disclaimer) before running it anywhere near live money. Not affiliated with or endorsed by NinjaTrader or Telegram.
 
@@ -93,8 +93,10 @@ Net liq 48,730.10 · floor 48,000.00
 1. **Telegram.** Message @BotFather, send `/newbot`, and copy the token. Open your new bot and press **Start**. Message @userinfobot to get your numeric user ID.
 2. **Copy the code.** Copy the whole `src/DirectTelegramNotifier` folder into `Documents\NinjaTrader 8\bin\Custom\AddOns\`, so you end up with `AddOns\DirectTelegramNotifier\DirectTelegramNotifier.cs` and its siblings.
 3. **Compile.** In NinjaTrader open **New > NinjaScript Editor** and press **F5**.
-4. **Configure.** The first compile creates `Documents\NinjaTrader 8\DirectTelegramNotifier.config` (or copy `config/DirectTelegramNotifier.config.example` there). Set `AuthorizedChatID`, `AccountName` (leader first), and the token (see below). Press **F5** again.
+4. **Configure.** The first compile creates `Documents\NinjaTrader 8\DirectTelegramNotifier.config` (or copy `config/DirectTelegramNotifier.config.example` there). Set `AuthorizedChatID`, `AccountName` (leader first), and the token (see below). Press **F5** again. *
 5. **Check.** You should get a "Notifier online" message in Telegram. Send `/status`, then `/simulate` to see every alert type.
+
+\*For a filled-in example, see config/DirectTelegramNotifier.mffu-rapid-eod-50k.config.example: three prop-firm evaluation accounts, with the reasons for each change.
 
 **Upgrading from 0.2 or earlier:** first **delete `AddOns\DirectTelegramNotifierAddOn.cs`**, the old single file. If you keep it, NinjaTrader reports the class as defined twice. Your config, floors and logs carry over, and new settings use their defaults.
 
@@ -175,6 +177,11 @@ The config is read at startup only. After editing it, press F5 in the NinjaScrip
 | `EnableFillCsv` | `true` | Append every fill and leader-vs-follower comparison to `DirectTelegramNotifier-fills.csv` |
 
 \* Can also be set for one account: `Key:AccountName=value`, for example `DrawdownAmount:Acct002=2500`. Unrecognized keys are reported in Telegram at startup.
+
+### Worked example
+`config/DirectTelegramNotifier.mffu-rapid-eod-50k.config.example` shows one real setup: three 50k end-of-day
+evaluation accounts with limits also set in the broker. It is an example, not a preset. Firm rules change,
+so check your own plan. Placeholders mark what you must replace.
 
 ## Risk: floors, daily loss and locks
 

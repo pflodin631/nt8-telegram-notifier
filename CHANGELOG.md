@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.0 (2026-10-27)
+
+Risk enforcement, delivery guarantees, configurable drawdown models, and real unit tests. Based partly on an external code review.
+
+**Upgrading from 0.2:** the add-on is now a folder of files. **Delete `AddOns\DirectTelegramNotifierAddOn.cs`** before copying the new `DirectTelegramNotifier` folder into `AddOns`, or NinjaTrader will report the class as defined twice. Your config, floors and logs carry over; new keys use their defaults.
+
+Risk
+- **Account lock.** Auto-flatten now *latches*: the account stays locked, and anything that opens on it is flattened again at once (from the execution event, with a 1 s fallback) until `/unlock` or the session ends. Before, a copier or strategy could re-enter and trade through the floor during a 10-minute cooldown. Locks survive a restart within the same session.
+- `/lock [account]` and `/unlock [account]`: keep an account flat on demand.
+- **Hold after `/flatten`** (`FlattenHoldSeconds=30`): a copier or strategy re-entry, or a follower flipped by the copier copying the leader's close, is closed again.
+- **Drawdown modes** (`DrawdownMode=off|manual|static|eod|intraday`, with `StartingBalance`, `DrawdownAmount`, `FloorLock`): enter your rule once instead of a number every day. High-water marks are saved across restarts. `/floor` still overrides.
+- **Daily loss limit** (`DailyLossLimit`, dollars or percent; `DailyLossAlerts`; optional `DailyLossAutoFlatten`).
+- **Risk UNKNOWN:** holding a position while data is disconnected or stale (net liquidation frozen) alerts once and pauses automatic action for that account.
+- Faster: risk is checked every second (was 5 s), and confirmation is time-based (`RiskConfirmSeconds=2`) instead of two readings.
+- **Floor validation:** a `/floor` above net liquidation, inside your alert levels, or moving more than `FloorJumpConfirm` needs a button press.
+- Per-account overrides for `DrawdownMode`, `RiskFloor`, `StartingBalance`, `DrawdownAmount`, `FloorLock`, `DailyLossLimit` (`Key:Account=value`).
+- `/risk` report; `/risk reset [account]` restarts a trailing floor.
+
+Delivery
+- **Priority lane:** problem alerts and command replies are sent before routine messages; four or more waiting routine messages are merged into one. A Telegram rate limit pauses all sending; a new priority alert is tried immediately during a network backoff.
+- **Heartbeat vouches for delivery:** the external ping is held while Telegram is unreachable, the token is rejected, or alerts are stuck in the queue, so your dead-man's switch fires. Uses `getMe` when there is no other traffic.
+- TCP keepalive on the Telegram connection; shorter long-poll timeout.
+
+Smaller
+- **Unrecognized config keys are reported** (with "did you mean" suggestions), as are invalid modes, quiet windows and order states.
+- `/leader [account|clear]`, saved across restarts.
+- `/flatten` and `/cancel` no longer hold up other commands during their verification wait.
+- Custom stale-data schedules (`StaleDataSchedule=custom`, `StaleDataQuietWindows`, `StaleDataTimeZone`) for non-CME markets.
+- `StuckOrderStates` and `FillGroupMs` are configurable.
+- The re-entry alert points to `/lock`.
+
+Structure and testing
+- Split into partial-class files plus `DirectTelegramNotifier.Core.cs`, which holds the pure logic with no NinjaTrader types.
+- `tests/CoreTests.cs`: 153 unit tests, run with `tests\run-tests.ps1` using the compiler built into Windows. See `docs/TESTING.md`.
+- The README's Verified table now separates unit-tested, seen on Sim and seen live.
+
+
 ## 0.2.0 (2026-10-26)
 
 Safety checks, account-level risk and targeted commands.

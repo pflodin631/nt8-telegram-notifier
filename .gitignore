@@ -21,3 +21,6 @@ DirectTelegramNotifier-fills.csv
 DirectTelegramNotifier-fills.csv.old
 DirectTelegramNotifier.floors
 *.csv
+DirectTelegramNotifier.state
+DirectTelegramNotifier.state.tmp
+*.exe

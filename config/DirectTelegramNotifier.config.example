@@ -1,6 +1,4 @@
-# DirectTelegramNotifier configuration (example)
-# Copy this file to:  Documents\NinjaTrader 8\DirectTelegramNotifier.config
-# and fill in the values. Do not commit your real config anywhere.
+# DirectTelegramNotifier configuration
 # After editing: press F5 in the NinjaScript Editor, or restart NinjaTrader.
 
 # --- Telegram ---
@@ -42,8 +40,16 @@ RestartGapThresholdSec=45
 EnableStrategyWatch=true
 # StaleDataSeconds: alert when an instrument you trade gets no ticks this long while the data connection says Connected. 0 = off.
 StaleDataSeconds=120
-# StaleDataSchedule: cme = ignore the daily 17:00-18:00 ET break and the weekend; always = never ignore.
+# StaleDataSchedule: when no ticks are expected, so silence is not an alarm.
+#   cme    = CME-style futures week: daily 17:00-18:00 and Fri 17:00 to Sun 18:00, US Eastern
+#   always = the feed should tick around the clock (crypto, or to switch the schedule off)
+#   custom = your own quiet windows below, in StaleDataTimeZone
 StaleDataSchedule=cme
+# StaleDataQuietWindows: used with custom. Semicolon-separated 'Days HH:mm-HH:mm'; days are Mon..Sun, ranges (Mon-Thu), Daily, Weekdays or Weekends.
+# A window cannot cross midnight: split it. Example (US stocks, Eastern): Weekdays 00:00-09:30; Weekdays 16:00-24:00; Weekends 00:00-24:00
+StaleDataQuietWindows=
+# StaleDataTimeZone: Windows time zone id for custom windows, e.g. Eastern Standard Time, Central Europe Standard Time, GMT Standard Time.
+StaleDataTimeZone=Eastern Standard Time
 # StaleDataInstruments: extra instruments to always watch, comma-separated (e.g. MNQ 12-26). Instruments you trade or hold are watched automatically.
 StaleDataInstruments=
 # EnableAlertLog: also append every alert to DirectTelegramNotifier.log in this folder.
@@ -64,20 +70,51 @@ ProtectiveCheckSeconds=0
 # OrphanOrderSeconds: alert when an account is flat but exit-type orders (name contains one of OrphanOrderNames) keep working this long. 0 = off.
 OrphanOrderSeconds=20
 OrphanOrderNames=Stop,Target
-# StuckOrderSeconds: alert when an order sits in Submitted / change pending / cancel pending this long. 0 = off.
+# StuckOrderSeconds: alert when an order sits in one of StuckOrderStates this long. 0 = off.
 StuckOrderSeconds=30
+# StuckOrderStates: NinjaTrader order states that should pass quickly. Add Accepted only if your broker moves orders past it quickly.
+StuckOrderStates=Submitted,ChangePending,ChangeSubmitted,CancelPending,CancelSubmitted
 # MaxPositionContracts: alert when an account holds more than this many contracts in total. 0 = off.
 MaxPositionContracts=0
 
-# --- Risk buffer (prop-firm drawdown floor) ---
-# RiskFloor: the Net Liquidation value at which an account fails, from your firm's rules. Blank = off.
-# Most trailing floors move: update them with the /floor command. A per-account floor overrides it, e.g.  RiskFloor:MyAccount001=48500
+# --- Risk: drawdown floor and daily loss limit ---
+# Enter YOUR rules: these are not firm presets. Check /risk against your broker's or firm's own dashboard.
+# Any line marked (per account) can also be set for one account:  Key:AccountName=value  e.g.  DrawdownAmount:Acct002=2500
+#
+# DrawdownMode (per account): how the floor is found.
+#   off      = no floor checks
+#   manual   = the floor is RiskFloor below, or whatever you set with /floor
+#   static   = StartingBalance - DrawdownAmount; it never moves
+#   eod      = trails the highest end-of-day balance (at EodReportTime): floor = high - DrawdownAmount, capped at FloorLock
+#   intraday = trails the highest live net liquidation, including open profit, capped at FloorLock
+# A /floor setting always overrides the mode until /floor clear.
+DrawdownMode=manual
+# RiskFloor (per account): the floor for manual mode, in net liquidation dollars. Blank = none.
 RiskFloor=
-# RiskBufferAlerts: alert as Net Liquidation comes within these many dollars of the floor.
+# StartingBalance (per account): account size. Needed for static; trailing modes start from it (else from current net liquidation).
+StartingBalance=
+# DrawdownAmount (per account): the maximum drawdown in dollars, for static, eod and intraday.
+DrawdownAmount=
+# FloorLock (per account): a trailing floor stops rising at this value (often starting balance + a little). Blank = never locks.
+FloorLock=
+# RiskBufferAlerts: alert as net liquidation comes within these many dollars of the floor.
 RiskBufferAlerts=1500,750,300
-# RiskAutoFlatten: true = flatten an account that gets within RiskFlattenBuffer dollars of its floor. Test on Sim first.
+# RiskAutoFlatten: true = an account that stays within RiskFlattenBuffer of its floor for RiskConfirmSeconds is flattened and LOCKED:
+# anything that opens on it afterwards is closed again until /unlock or the session ends. Test on Sim first.
 RiskAutoFlatten=false
 RiskFlattenBuffer=150
+# RiskConfirmSeconds: how long a breach must last before auto-flatten acts (filters a single bad reading). 1-30.
+RiskConfirmSeconds=2
+# FloorJumpConfirm: /floor asks for a button press when it moves a floor by more than this, or puts it inside your alert levels. 0 = only the latter.
+FloorJumpConfirm=1000
+#
+# DailyLossLimit (per account): maximum loss per session, measured from net liquidation at the session start (EodReportTime).
+# Dollars (1000) or percent of the session-start value (2%). Blank = off.
+DailyLossLimit=
+# DailyLossAlerts: percentages of the limit that alert.
+DailyLossAlerts=50,75,90
+# DailyLossAutoFlatten: true = flatten and lock an account that reaches its daily loss limit.
+DailyLossAutoFlatten=false
 
 # --- Machine health (the NinjaTrader process) ---
 # CpuAlertPercent / CpuAlertSeconds: alert when NinjaTrader's CPU stays at or above this level this long. 0 = off.
@@ -89,8 +126,13 @@ MemoryAlertMB=0
 DiskAlertMB=2000
 
 # --- Convenience ---
-# FlattenConfirm: true = /flatten first shows Confirm / Cancel buttons (expire after 30 s). false = flatten immediately.
+# FlattenConfirm: true = /flatten and /lock first show Confirm / Cancel buttons (expire after 30 s). false = act immediately.
 FlattenConfirm=false
+# FlattenHoldSeconds: after /flatten, anything that opens on those accounts in this many seconds is closed again
+# (catches a copier or strategy putting the position back, or flipping a follower). 0 = off.
+FlattenHoldSeconds=30
+# FillGroupMs: fills of the same instrument and side within this many milliseconds become one message (500-10000).
+FillGroupMs=2000
 # SilentRoutineAlerts: true = fills, reconnects, in-sync notices, reports and command replies arrive without a notification sound; problems still ring.
 SilentRoutineAlerts=false
 # EnableFillCsv: write every fill (and leader vs follower comparison) to DirectTelegramNotifier-fills.csv in this folder.

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (2026-10-27)
+## 0.3.0 (2026-10-28)
 
 Risk enforcement, delivery guarantees, configurable drawdown models, and real unit tests. Based partly on an external code review.
 

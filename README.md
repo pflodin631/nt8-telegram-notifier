@@ -2,7 +2,7 @@
 
 Telegram alerts, risk enforcement and a small remote-control surface for **NinjaTrader 8**, as an AddOn. It talks straight to the Telegram Bot API over HTTPS: no NinjaTrader Share Services, no relay or server of mine, no extra DLLs. Telegram itself carries your alerts, including account names and dollar amounts. If you opt in, a short alert without amounts also goes to a push service you choose (see [Second alert channel](#second-alert-channel-optional)), and optionally a heartbeat URL. It works for personal accounts and prop-firm accounts alike: you describe your own risk rules in the config, and it has no firm presets (the example config file below is a worked example, not a preset).
 
-> **Status: beta (v0.5.1).** It can flatten and lock accounts on command and, if you switch it on, automatically. The 0.3 to 0.5 risk features are unit-tested but **not yet verified on Sim**: see [Verified so far](#verified-so-far). Read [Limitations](#limitations) and the [Disclaimer](#disclaimer) before running it anywhere near live money. Not affiliated with or endorsed by NinjaTrader or Telegram.
+> **Status: beta (v0.5.1).** It can flatten and lock accounts on command and, if you switch it on, automatically. Read [Limitations](#limitations) and the [Disclaimer](#disclaimer) before running it anywhere near live money. Not affiliated with or endorsed by NinjaTrader or Telegram.
 
 **Tested with:** NinjaTrader **8.1.8.4**, a **Tradovate** connection (MFFU), Sim101 and MFFU evaluation accounts.
 
@@ -224,7 +224,7 @@ A wrong rule gives false comfort or false alarms. **Test on Sim first** ([docs/T
 
 ## Account rules: consistency and inactivity
 
-Prop firms add rules beyond the drawdown. The notifier tracks two of them from numbers you enter. It does not know your firm's rules, they differ between plans and change over time, and **sources I found disagree** (for one firm the consistency limit appears as 30%, 40% and 50% depending on the plan and the page). Enter the values from your own account's rules.
+Prop firms add rules beyond the drawdown. The notifier tracks two of them from numbers you enter. It does not know your firm's rules--they differ between plans and change over time. Enter the values from your own account's up-to-date rules.
 
 **Consistency rule.** "No single day may be more than X% of total profit." Set `ConsistencyPercent` and `StartingBalance`. With profit banked before today, the most today can add is `X% / (100% - X%)` of that profit: for a 30% rule and 1,000 banked, 428.57. `/risk` shows today's profit against that cap and your best day's share of total profit, and you are alerted at 75% and 90% of the cap. The cap only limits **today**: if an earlier day is already over the limit, `/risk` also shows how much more total profit brings it back (best day ÷ the percentage − total profit), to be earned on smaller days. `ConsistencyAutoFlatten=true` flattens and locks the account when it reaches the cap. Notes:
 - Today's profit includes open profit, so it warns early rather than late.

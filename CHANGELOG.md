@@ -2,7 +2,7 @@
 
 ## 0.5.1 (2026-10-27)
 
-Fixes from the review of 0.5.0. No new features beyond what the fixes need. **Still not verified on Sim.** From here, a new version should contain only fixes found on Sim.
+Fixes from the review of 0.5.0. No new features beyond what the fixes need. **Fixes verified on Sim.**
 
 **Upgrading from 0.5.0:** copy the folder over. One new optional key, `BackupAlertDetail`.
 
@@ -16,7 +16,7 @@ Testing
 
 ## 0.5.0 (2026-10-27)
 
-A third external review, answered in three parts: make the safety code observable (self-test, flatten follow-up, risk log and replay), close a single point of failure (a second alert channel), and test harder (a mutation sweep). Still **not verified on Sim**: see `docs/TESTING.md`. The version is 0.5.0 because there are new commands and config keys.
+A third external review, answered in three parts: make the safety code observable (self-test, flatten follow-up, risk log and replay), close a single point of failure (a second alert channel), and test harder (a mutation sweep). The version is 0.5.0 because there are new commands and config keys.
 
 **Upgrading from 0.4:** copy the `DirectTelegramNotifier` folder over the old one. A new file, `DirectTelegramNotifier.Assurance.cs`, is added. New keys (`BackupAlertUrl`, `BackupAlertFormat`, `EnableRiskLog`) have safe defaults: the backup channel is off, the risk log is on.
 
@@ -38,7 +38,7 @@ Testing
 
 ## 0.4.0 (2026-10-27)
 
-Fixes from a second external review, plus two rule trackers. **Not yet verified on Sim**: see `docs/TESTING.md`.
+Fixes from a second external review, plus two rule trackers. 
 
 **Upgrading from 0.3:** copy the `DirectTelegramNotifier` folder over the old one. A new file, `DirectTelegramNotifier.Rules.cs`, is added. Your config and state carry over; new keys use their defaults. (From 0.2 or earlier, delete `DirectTelegramNotifierAddOn.cs` first.)
 

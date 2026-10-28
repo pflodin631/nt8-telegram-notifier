@@ -13,7 +13,7 @@ Please use GitHub's **private vulnerability reporting** (the repository's **Secu
 - Telegram messages queued before startup are discarded and commands older than 120 seconds are ignored, so a stale `/flatten` never runs after a restart.
 - The config file is plain text. Prefer the `NT_TELEGRAM_BOT_TOKEN` environment variable for the token, and turn on two-step verification on your Telegram account: whoever controls it can send `/flatten`.
 
-## Secrets and data on disk (0.5)
+## Secrets and data on disk (v0.5.0+)
 
 - **`BackupAlertUrl` is a secret.** With ntfy the topic name is effectively the password: anyone who knows the URL can read and send to it. Use a long random topic, do not paste the URL into issues or screenshots, and treat a leaked URL like a leaked token (change the topic). It is redacted from the NinjaScript Output window and the log.
 - **The risk log (`DirectTelegramNotifier-risk.csv`) holds account names and balances.** It stays on your machine and is in `.gitignore`. Scrub it before attaching any part of it to an issue; set `EnableRiskLog=false` if you do not want it written.

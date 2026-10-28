@@ -317,41 +317,41 @@ Tested with NinjaTrader **8.1.8.4**, a **Tradovate** connection (MFFU), Sim101 a
 - **Unit-tested:** the pure logic, including the risk state machine (session rollover, restarts, data outages, floors, daily loss, consistency), is covered by `tests/CoreTests.cs`. "beh." means the behavioural tests in `tests/behavioral`, which compile the whole add-on against a stand-in NinjaTrader API and drive it through its real entry points: anyone can run them (`bash tests/run-behavioral.sh`, needs Mono). They cannot prove how NinjaTrader or a broker behaves. `bash tests/run-replay.sh` replays recorded risk logs (`tests/replay/cases`) through the same logic: a session you record on Sim can become a permanent test.
 - **Sim / Live:** seen working inside NinjaTrader. "0.x" is the version it was seen in. A feature changed since then needs re-checking.
 
-| Feature | Unit-tested | Sim | Live |
-|---|---|---|---|
-| Compiles (NinjaTrader 8.1.8.4) | C# 5 compile | ⬜ 0.5 | ⬜ |
-| Fill alerts, partial fills, grouping | beh. | ✅ 0.1.x | ⬜ |
-| `/flatten` (leader and followers) | beh. | ✅ 0.1.x | ⬜ |
-| Hold after `/flatten` (copier flips) | beh. | ⬜ | ⬜ |
-| Connection drop / restore alerts | — | ✅ 0.1.x | ⬜ |
-| Restart report, online message | — | ✅ 0.1.x | ⬜ |
-| `/status`, `/copy`, `/simulate` | beh. | ✅ 0.1.x | ⬜ |
-| Heartbeat ping | — | ✅ 0.1.x | ⬜ |
-| Heartbeat held when delivery fails (including refused sends) | beh. | ⬜ | ⬜ |
-| Priority lane and merging | beh. | ⬜ | ⬜ |
-| `FlattenConfirm` buttons | beh. | ⬜ | ⬜ |
-| Rejected-order and order-rate alerts | — | ⬜ | ⬜ |
-| Strategy enabled / disabled alerts | — | ⬜ | ⬜ |
-| Stale-data alerts, custom schedules | ✅ windows | ⬜ | ⬜ |
-| Copier mismatch alerts, `/leader` | beh. | ⬜ | ⬜ |
-| Unprotected, orphan, stuck, position-limit alerts | beh. | ⬜ | ⬜ |
-| Floor alerts and `/floor` validation | ✅ | ⬜ | ⬜ |
-| Drawdown modes (static, eod, intraday) | ✅ | ⬜ | ⬜ |
-| Daily loss limit | ✅ | ⬜ | ⬜ |
-| Auto-flatten and account lock | ✅ decision logic, beh. | ⬜ | ⬜ |
-| Risk UNKNOWN on stale data or this account's connection down, reminders, optional flatten | ✅ state machine, beh. | ⬜ | ⬜ |
-| End-of-day trailing on closing balance, `/risk seed`, uncertain-closing warning | ✅ state machine, beh. | ⬜ | ⬜ |
-| Consistency rule cap, cure line and alerts | ✅ state machine, beh. | ⬜ | ⬜ |
-| Inactivity clock and `/activity` | ✅ formulas, beh. | ⬜ | ⬜ |
-| Several confirm buttons pending at once, `LockGroup` | beh. | ⬜ | ⬜ |
-| Self-test and the armed / not armed line | ✅ checks, beh. | ⬜ | ⬜ |
-| Flatten follow-up (FLAT CONFIRMED / STILL EXPOSED) | beh. | ⬜ | ⬜ |
-| Second alert channel (`/testbackup`, routing, Telegram-down alert) | ✅ routing, beh. | ⬜ | ⬜ |
-| Risk log and replay (live = replay) | ✅ replay, beh. | ⬜ | ⬜ |
-| `/unlock` confirmation, command audit log | beh. | ⬜ | ⬜ |
-| Config warnings (including new keys) | ✅ | ⬜ | ⬜ |
-| CPU, memory and disk alerts | beh. | ⬜ | ⬜ |
-| End-of-day summary | beh. | ⬜ | ⬜ |
+| Feature | Unit-tested | Sim / Live |
+|---|---|---|
+| Compiles (NinjaTrader 8.1.8.4) | C# 5 compile | ✅ 0.5 |
+| Fill alerts, partial fills, grouping | beh. | ✅ 0.1.x |
+| `/flatten` (leader and followers) | beh. | ✅ 0.1.x |
+| Hold after `/flatten` (copier flips) | beh. | ✅ |
+| Connection drop / restore alerts | — | ✅ 0.1.x |
+| Restart report, online message | — | ✅ 0.1.x |
+| `/status`, `/copy`, `/simulate` | beh. | ✅ 0.1.x |
+| Heartbeat ping | — | ✅ 0.1.x |
+| Heartbeat held when delivery fails (including refused sends) | beh. | ⬜ |
+| Priority lane and merging | beh. | ✅ |
+| `FlattenConfirm` buttons | beh. | ✅ |
+| Rejected-order and order-rate alerts | — | ✅ |
+| Strategy enabled / disabled alerts | — | ✅ |
+| Stale-data alerts, custom schedules | ✅ windows | ⬜ |
+| Copier mismatch alerts, `/leader` | beh. | ✅ |
+| Unprotected, orphan, stuck, position-limit alerts | beh. | ✅ |
+| Floor alerts and `/floor` validation | ✅ | ✅ |
+| Drawdown modes (static, eod, intraday) | ✅ | ✅ |
+| Daily loss limit | ✅ | ✅ |
+| Auto-flatten and account lock | ✅ decision logic, beh. | ✅ |
+| Risk UNKNOWN on stale data or this account's connection down, reminders, optional flatten | ✅ state machine, beh. | ✅ |
+| End-of-day trailing on closing balance, `/risk seed`, uncertain-closing warning | ✅ state machine, beh. | ✅ |
+| Consistency rule cap, cure line and alerts | ✅ state machine, beh. | ✅ |
+| Inactivity clock and `/activity` | ✅ formulas, beh. | ✅ |
+| Several confirm buttons pending at once, `LockGroup` | beh. | ⬜ |
+| Self-test and the armed / not armed line | ✅ checks, beh. | ✅ |
+| Flatten follow-up (FLAT CONFIRMED / STILL EXPOSED) | beh. | ✅ |
+| Second alert channel (`/testbackup`, routing, Telegram-down alert) | ✅ routing, beh. | ⬜ |
+| Risk log and replay (live = replay) | ✅ replay, beh. | ⬜ |
+| `/unlock` confirmation, command audit log | beh. | ✅ |
+| Config warnings (including new keys) | ✅ | ⬜ |
+| CPU, memory and disk alerts | beh. | ✅ |
+| End-of-day summary | beh. | ✅ |
 
 ## Troubleshooting
 

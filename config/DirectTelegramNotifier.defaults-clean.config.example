@@ -1,0 +1,96 @@
+# --- Telegram ---
+BotToken=
+AuthorizedChatID=
+
+# --- Accounts ---
+AccountName=Sim101
+
+# --- Features ---
+EnableWatchdog=true
+EnableExecutions=true
+EnableRemoteCommands=true
+EnableOrderRejectAlerts=true
+RunawayMaxOrders=30
+RunawayWindowSec=60
+UseGlobalFlattenEverything=false
+
+# --- End of day ---
+EodReportTime=170000
+EodTimeZoneId=Eastern Standard Time
+EstimatedCommissionPerSide=0
+
+# --- Heartbeat and restart detection ---
+HeartbeatUrl=
+HeartbeatIntervalSec=60
+RestartGapThresholdSec=45
+
+# --- Monitoring ---
+EnableStrategyWatch=true
+StaleDataSeconds=120
+StaleDataSchedule=cme
+StaleDataQuietWindows=
+StaleDataTimeZone=Eastern Standard Time
+StaleDataInstruments=
+EnableAlertLog=true
+
+# --- Trade copier check (e.g. Replikanto) ---
+LeaderAccount=
+FollowerRatio=1
+MismatchSeconds=20
+
+# --- Safety checks ---
+ProtectiveCheckSeconds=0
+OrphanOrderSeconds=20
+OrphanOrderNames=Stop,Target
+StuckOrderSeconds=30
+StuckOrderStates=Submitted,ChangePending,ChangeSubmitted,CancelPending,CancelSubmitted
+MaxPositionContracts=0
+
+# --- Risk: drawdown floor and daily loss limit ---
+DrawdownMode=manual
+HighWaterBasis=balance
+RiskFloor=
+StartingBalance=
+DrawdownAmount=
+FloorLock=
+RiskBufferAlerts=1500,750,300
+RiskAutoFlatten=false
+RiskFlattenBuffer=150
+RiskConfirmSeconds=2
+FloorJumpConfirm=1000
+UnknownFlattenSeconds=0
+LockGroup=false
+DailyLossLimit=
+DailyLossAlerts=50,75,90
+DailyLossAutoFlatten=false
+
+# --- Consistency rule (best day as a share of total profit) ---
+ConsistencyPercent=
+ConsistencyProfitTarget=
+ConsistencyAlerts=75,90
+ConsistencyAutoFlatten=false
+
+# --- Inactivity rule ---
+InactivityDays=
+InactivityAlerts=3,2,1
+
+# --- Second alert channel (optional) ---
+BackupAlertUrl=
+BackupAlertFormat=text
+BackupAlertDetail=minimal
+
+# --- Risk log (for replaying a real session) ---
+EnableRiskLog=true
+
+# --- Machine health (the NinjaTrader process) ---
+CpuAlertPercent=90
+CpuAlertSeconds=180
+MemoryAlertMB=0
+DiskAlertMB=2000
+
+# --- Convenience ---
+FlattenConfirm=false
+FlattenHoldSeconds=30
+FillGroupMs=2000
+SilentRoutineAlerts=false
+EnableFillCsv=true
